@@ -34,14 +34,27 @@ def list_images(folder: Path) -> list[Path]:
     return sorted(p for p in folder.glob("*.jpg") if p.parent.name != "Results")
 
 
-def is_fisheye_circle(gray: np.ndarray) -> bool:
-    """Detect a vignetted image circle: dark corners, bright center."""
-    h, w = gray.shape
-    k = max(8, h // 20)
-    corners = [gray[:k, :k], gray[:k, -k:], gray[-k:, :k], gray[-k:, -k:]]
-    corner_mean = np.mean([c.mean() for c in corners])
-    center = gray[h // 2 - k:h // 2 + k, w // 2 - k:w // 2 + k].mean()
-    return corner_mean < 12 and center > 4 * max(corner_mean, 1.0)
+def is_fisheye_circle(images: list[Path]) -> bool:
+    """Detect a vignetted image circle.
+
+    A dark studio background can make single-image corner checks
+    misfire; outside a fisheye's image circle the corners are optically
+    black in EVERY image, so sample several images and require it
+    consistently.
+    """
+    idx = np.linspace(0, len(images) - 1, min(5, len(images))).astype(int)
+    corner_max = 0.0
+    center_ok = 0
+    for i in idx:
+        gray = cv2.imread(str(images[i]), cv2.IMREAD_GRAYSCALE)
+        h, w = gray.shape
+        k = max(8, h // 20)
+        corners = [gray[:k, :k], gray[:k, -k:], gray[-k:, :k], gray[-k:, -k:]]
+        corner_max = max(corner_max, max(float(c.mean()) for c in corners))
+        center = gray[h // 2 - k:h // 2 + k, w // 2 - k:w // 2 + k].mean()
+        if center > 40:
+            center_ok += 1
+    return corner_max < 12 and center_ok >= len(idx) // 2
 
 
 def classify(images: list[Path], board: MarkerBoard):
@@ -50,8 +63,8 @@ def classify(images: list[Path], board: MarkerBoard):
     det = DotMarkerDetector(board, DotMarkerDetectorConfig(work_scale=scale))
     n_dots = len(det.detect(mid))
     if n_dots >= 20:
-        return "dots", is_fisheye_circle(mid), scale
-    return "checker", is_fisheye_circle(mid), scale
+        return "dots", is_fisheye_circle(images), scale
+    return "checker", is_fisheye_circle(images), scale
 
 
 def load_reference_xml(folder: Path):
