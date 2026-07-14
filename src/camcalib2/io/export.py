@@ -75,6 +75,47 @@ def write_vendor_xml(result: CalibrationResult, path, camera_id: str,
     tree.write(str(path), encoding="UTF-8", xml_declaration=True)
 
 
+def write_ocam_xml(ocam_result, path, camera_id: str,
+                   lens_id: str = "00000000000",
+                   points: np.ndarray | None = None,
+                   description: str | None = None) -> None:
+    """Write the legacy OCam (Scaramuzza) result format.
+
+    ``ocam_result`` is a :class:`camcalib2.calibration.ocam.OcamCalibrationResult`.
+    """
+    m = ocam_result.model
+    w, h = m.image_size
+    root = ET.Element("calibration", version="1.0")
+    ET.SubElement(root, "serialCamera").text = camera_id
+    ET.SubElement(root, "serielLens").text = lens_id
+    ET.SubElement(root, "cx").text = _fmt(m.cx)
+    ET.SubElement(root, "cy").text = _fmt(m.cy)
+    ET.SubElement(root, "c").text = _fmt(m.c)
+    ET.SubElement(root, "d").text = _fmt(m.d)
+    ET.SubElement(root, "e").text = _fmt(m.e)
+    ET.SubElement(root, "a0").text = _fmt(m.poly[0])
+    ET.SubElement(root, "a2").text = _fmt(m.poly[1])
+    ET.SubElement(root, "a3").text = _fmt(m.poly[2])
+    ET.SubElement(root, "a4").text = _fmt(m.poly[3])
+    half_diag = float(np.hypot(w / 2.0, h / 2.0))
+    if points is not None and len(points):
+        r = np.hypot(points[:, 0] - m.cx, points[:, 1] - m.cy)
+        rad = float(min(1.0, r.max() / half_diag))
+    else:
+        rad = 1.0
+    ET.SubElement(root, "rad").text = _fmt(rad)
+    ET.SubElement(root, "calDate").text = description or _dt.date.today().isoformat()
+    ET.SubElement(root, "comment").text = (
+        "- (cx, cy) is the intersection point of the optical achsis with the image plane in pixel coordinates \n"
+        "    - c, d, e are affine transformation parametes describing the deviation of the fisheye image from a perfect circular \n"
+        "    - a0, a2, a3, a4 are the coefficients of the polynomial which describes the camera system: "
+        "f(r) = a0 + a2*r^2 + a3*r^3 + a4*r^4 \n"
+        "    - rad is the confidence radius i.e. the distance from the outer most marker in one of the pattern "
+        "images to the optical center")
+    ET.indent(root)
+    ET.ElementTree(root).write(str(path), encoding="UTF-8", xml_declaration=True)
+
+
 def write_opencv_yaml(result: CalibrationResult, path) -> None:
     fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_WRITE)
     try:
@@ -127,8 +168,10 @@ def render_result_image(result: CalibrationResult,
 def export_all(result: CalibrationResult, out_dir, camera_id: str,
                views_points: list[np.ndarray], views_errors: list[np.ndarray],
                pixel_size_mm: tuple[float, float] | None = None,
-               description: str | None = None) -> dict[str, Path]:
-    """Write vendor XML (pinhole only), OpenCV YAML and result image."""
+               description: str | None = None,
+               ocam_result=None) -> dict[str, Path]:
+    """Write vendor XML (pinhole) / ocam XML (fisheye), OpenCV YAML and
+    the result image."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     written = {}
@@ -137,6 +180,10 @@ def export_all(result: CalibrationResult, out_dir, camera_id: str,
         p = out / f"{camera_id}-ocv.xml"
         write_vendor_xml(result, p, camera_id, pixel_size_mm, description, pts)
         written["vendor_xml"] = p
+    if ocam_result is not None:
+        p = out / f"{camera_id}-ocam.xml"
+        write_ocam_xml(ocam_result, p, camera_id, points=pts, description=description)
+        written["ocam_xml"] = p
     p = out / f"{camera_id}-opencv.yaml"
     write_opencv_yaml(result, p)
     written["opencv_yaml"] = p

@@ -57,14 +57,22 @@ def compare_pinhole(cfg, ref, views):
 
 
 def compare_fisheye(cfg, ref, views):
+    from camcalib2.calibration.ocam import calibrate_ocam
+
     w, h = cfg.image_size
-    r = calibrate(views, cfg.image_size, CameraModel.FISHEYE)
-    print(f"  ours (Kannala-Brandt): fx={r.fx:8.2f} fy={r.fy:8.2f} "
-          f"cx={r.cx:8.2f} cy={r.cy:8.2f} rms={r.rms:6.3f} "
-          f"(views={r.n_views}/{len(views)})")
-    print(f"  ref  (OCam):           cx={ref.cx:8.2f} cy={ref.cy:8.2f} "
-          f"a0={ref.poly[0]:.1f} rad={ref.rad:.3f}")
-    dc = float(np.hypot(r.cx - ref.cx, r.cy - ref.cy))
+    r = calibrate_ocam(views, cfg.image_size)
+    m = r.model
+    print(f"  ours (OCam): cx={m.cx:8.2f} cy={m.cy:8.2f} c={m.c:.5f} "
+          f"d={m.d:+.2e} e={m.e:+.2e}")
+    print(f"               a0={m.poly[0]:9.3f} a2={m.poly[1]:+.4e} "
+          f"a3={m.poly[2]:+.4e} a4={m.poly[3]:+.4e} rms={r.rms:.4f} "
+          f"(views={r.n_views}/{len(views)}, KB-Bootstrap rms={r.kb.rms:.4f})")
+    print(f"  ref  (OCam): cx={ref.cx:8.2f} cy={ref.cy:8.2f} c={ref.c:.5f} "
+          f"d={ref.d:+.2e} e={ref.e:+.2e}")
+    print(f"               a0={ref.poly[0]:9.3f} a2={ref.poly[1]:+.4e} "
+          f"a3={ref.poly[2]:+.4e} a4={ref.poly[3]:+.4e}")
+    dc = float(np.hypot(m.cx - ref.cx, m.cy - ref.cy))
+    da0 = 100 * abs(m.poly[0] - ref.poly[0]) / abs(ref.poly[0])
 
     # geometric comparison r(theta) within the confidence radius
     half_diag = float(np.hypot(w / 2, h / 2))
@@ -72,15 +80,11 @@ def compare_fisheye(cfg, ref, views):
     theta_max = float(ref.theta(r_conf))
     thetas = np.linspace(0.01, theta_max, 200)
     r_ref = ref.r_of_theta(thetas, r_max=half_diag * 1.5)
-    k = r.dist_coeffs
-    th_d = thetas * (1 + k[0] * thetas**2 + k[1] * thetas**4
-                     + k[2] * thetas**6 + k[3] * thetas**8)
-    f_iso = 0.5 * (r.fx + r.fy)
-    r_ours = f_iso * th_d
+    r_ours = m.r_of_theta(thetas)
     dr = np.abs(r_ours - r_ref)
-    print(f"  ==> |dc|={dc:.2f}px  r(theta) deviation inside confidence radius "
+    print(f"  ==> |dc|={dc:.2f}px  da0={da0:.3f}%  r(theta) deviation "
           f"({np.degrees(theta_max):.0f} deg): mean={dr.mean():.2f}px  max={dr.max():.2f}px")
-    return {"dc_px": dc, "dr_mean_px": float(dr.mean()),
+    return {"dc_px": dc, "da0_pct": da0, "dr_mean_px": float(dr.mean()),
             "dr_max_px": float(dr.max()), "theta_max_deg": float(np.degrees(theta_max)),
             "rms": r.rms}
 
@@ -117,8 +121,9 @@ def main() -> int:
                   f"|dc|={res['dc_px']:5.2f}px rms {res['rms']:.3f} vs ref {res['ref_rms']:.3f}")
         else:
             print(f"{name[:46]:48s} ocam |dc|={res['dc_px']:5.2f}px "
+                  f"da0={res.get('da0_pct', float('nan')):.3f}% "
                   f"dr mean={res['dr_mean_px']:5.2f}px max={res['dr_max_px']:5.2f}px "
-                  f"(bis {res['theta_max_deg']:.0f} deg), rms KB {res['rms']:.3f}")
+                  f"(bis {res['theta_max_deg']:.0f} deg), rms {res['rms']:.3f}")
     return 0
 
 

@@ -257,10 +257,18 @@ class MainWindow(QMainWindow):
         out = QFileDialog.getExistingDirectory(self, "Export-Verzeichnis wählen")
         if not out:
             return
+        ocam_result = None
+        if result.model is not None and result.model.value == "fisheye":
+            try:
+                from ..calibration.ocam import calibrate_ocam
+                ocam_result = calibrate_ocam(self._session.views,
+                                             self._session.image_size)
+            except Exception:
+                ocam_result = None  # KB/YAML export still succeeds
         ps = (self._pixel_size, self._pixel_size) if self._pixel_size else None
         written = export_all(result, out, self._camera_id,
                              result.used_image_points, result.per_point_errors,
-                             pixel_size_mm=ps)
+                             pixel_size_mm=ps, ocam_result=ocam_result)
         QMessageBox.information(
             self, "Export abgeschlossen",
             f"fx={result.fx:.2f} fy={result.fy:.2f}\n"

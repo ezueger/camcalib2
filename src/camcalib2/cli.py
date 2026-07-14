@@ -90,9 +90,18 @@ def main(argv=None) -> int:
     print(f"dist={np.round(result.dist_coeffs, 6)}")
     print(f"rms={result.rms:.4f} px")
 
+    ocam_result = None
+    if result.model is CameraModel.FISHEYE:
+        from .calibration.ocam import calibrate_ocam
+        ocam_result = calibrate_ocam(session.views, (w, h))
+        m = ocam_result.model
+        print(f"ocam: cx={m.cx:.2f} cy={m.cy:.2f} a0={m.poly[0]:.3f} "
+              f"rms={ocam_result.rms:.4f}")
+
     written = export_all(result, args.out, args.camera_id,
                          result.used_image_points, result.per_point_errors,
-                         pixel_size_mm=(args.pixel_size, args.pixel_size) if args.pixel_size else None)
+                         pixel_size_mm=(args.pixel_size, args.pixel_size) if args.pixel_size else None,
+                         ocam_result=ocam_result)
     for k, p in written.items():
         print(f"wrote {k}: {p}")
     return 0
