@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "camcalib2"
+version = "0.1.0"
+description = "Video-based camera intrinsics calibration for industrial GigE/GenICam cameras (perspective and fisheye lenses)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+]
+
+[project.optional-dependencies]
+ui = ["PySide6>=6.5"]
+genicam = ["harvesters>=1.4"]
+dev = ["pytest>=7", "opencv-python-headless>=4.8"]
+
+[project.scripts]
+camcalib2 = "camcalib2.ui.app:main"
+camcalib2-calibrate = "camcalib2.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"camcalib2.patterns" = ["resources/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
