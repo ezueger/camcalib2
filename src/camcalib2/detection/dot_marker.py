@@ -54,6 +54,10 @@ class DotMarkerDetectorConfig:
     max_slot_residual: float = 0.22
     #: blobs bigger than this multiple of the median dot area are split in two
     split_dot_factor: float = 1.7
+    #: full-resolution sub-pixel center refinement. Costs ~0.5 ms per
+    #: marker - disable for live preview (coverage/UI), enable for
+    #: keyframes that feed the calibration.
+    refine_subpixel: bool = True
 
 
 def identify_board(gray, boards: list[MarkerBoard] | None = None,
@@ -227,7 +231,10 @@ class DotMarkerDetector:
             return None
         marker_id, rot = decoded
 
-        center = self._refine_center(gray, labels, stats, ci, scale)
+        if cfg.refine_subpixel:
+            center = self._refine_center(gray, labels, stats, ci, scale)
+        else:
+            center = (float(c_ref[0]), float(c_ref[1]))
         return DetectedMarker(marker_id=marker_id, center=center,
                               ring_dots=len(dots), slot_rotation=rot, residual=rms)
 

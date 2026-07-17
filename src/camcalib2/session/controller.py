@@ -69,11 +69,19 @@ class CalibrationSession:
         self.image_size = image_size
         self.target = target
         if isinstance(target, MarkerBoard):
-            self._detector = DotMarkerDetector(target)
+            # fast preview detector for the live loop (coverage/UI),
+            # precise detector re-runs only on accepted keyframes
+            from ..detection.dot_marker import DotMarkerDetectorConfig
+            self._detector = DotMarkerDetector(
+                target, DotMarkerDetectorConfig(refine_subpixel=False))
+            self._detector_precise = DotMarkerDetector(target)
             self._detect = self._detect_markers
+            self._detect_precise = lambda gray: self._detect_markers(gray, precise=True)
         else:
-            self._detector = CheckerboardDetector(target)
+            self._detector = CheckerboardDetector(target, fast=True)
+            self._detector_precise = CheckerboardDetector(target)
             self._detect = self._detect_checkerboard
+            self._detect_precise = lambda gray: self._detect_checkerboard(gray, precise=True)
 
         self.coverage = CoverageMap(image_size)
         self.selector = KeyframeSelector(self.cfg.keyframe_policy)
@@ -88,8 +96,9 @@ class CalibrationSession:
         self._pending_views = 0
 
     # ------------------------------------------------------------------
-    def _detect_markers(self, gray):
-        markers = self._detector.detect(gray)
+    def _detect_markers(self, gray, precise=False):
+        det = self._detector_precise if precise else self._detector
+        markers = det.detect(gray)
         if not markers:
             return [], np.empty((0, 2), np.float32), None
         ids = [m.marker_id for m in markers]
@@ -97,8 +106,8 @@ class CalibrationSession:
         obj = self.target.object_points(ids)
         return ids, pts, obj
 
-    def _detect_checkerboard(self, gray):
-        det = self._detector.detect(gray)
+    def _detect_checkerboard(self, gray, precise=False):
+        det = (self._detector_precise if precise else self._detector).detect(gray)
         if det is None:
             return [], np.empty((0, 2), np.float32), None
         ids = list(range(len(det.image_points)))
@@ -111,16 +120,15 @@ class CalibrationSession:
 
         # model-guided recovery: once a preliminary calibration exists,
         # re-measure observations the detector missed (lens periphery!).
-        # For fisheye the recovered rim points must NOT feed OpenCV's
-        # fragile KB solver - they are used for coverage/UI here and are
-        # re-recovered into the OCam bundle adjustment on export.
-        base = (ids, pts, obj)
+        # Recovered points enrich coverage/UI on every frame; keyframes
+        # are re-detected precisely below, where recovery is applied only
+        # for pinhole (fisheye rim points would poison OpenCV's fragile
+        # KB solver - they are re-recovered into the OCam refinement on
+        # export instead).
         with self._lock:
             model_result = self._result
         if model_result is not None and len(ids) >= 8:
             ids, pts, obj = self._recover(gray, ids, pts, obj, model_result)
-        if self.cfg.model is CameraModel.PINHOLE:
-            base = (ids, pts, obj)
 
         keyframe = False
         reason = "no_target"
@@ -130,7 +138,17 @@ class CalibrationSession:
             new_cells = self.coverage.new_cells(pts)
             keyframe, reason = self.selector.consider(gray, ids, pts, timestamp, new_cells)
             if keyframe:
-                self._accept_keyframe(*base, timestamp)
+                # the live loop ran the fast preview detector; re-detect
+                # this one frame precisely (sub-pixel) for the calibration
+                p_ids, p_pts, p_obj = self._detect_precise(gray)
+                if len(p_ids) >= self.cfg.keyframe_policy.min_points:
+                    if (self.cfg.model is CameraModel.PINHOLE
+                            and model_result is not None and len(p_ids) >= 8):
+                        p_ids, p_pts, p_obj = self._recover(
+                            gray, p_ids, p_pts, p_obj, model_result)
+                    self._accept_keyframe(p_ids, p_pts, p_obj, timestamp)
+                else:
+                    keyframe, reason = False, "precise_detect_failed"
 
         with self._lock:
             result = self._result

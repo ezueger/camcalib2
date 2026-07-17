@@ -34,18 +34,23 @@ class CheckerboardDetection:
 
 class CheckerboardDetector:
     def __init__(self, board: Checkerboard, seed: tuple[int, int] = (5, 5),
-                 min_corners: int = 20):
+                 min_corners: int = 20, fast: bool = False):
+        """``fast=True`` skips the EXHAUSTIVE/ACCURACY passes - roughly
+        6x faster, finds nearly the same grid. Use for the live preview;
+        keyframes that feed the calibration should use the full mode."""
         self.board = board
         self.seed = seed
         self.min_corners = min_corners
+        self.fast = fast
 
     def detect(self, gray: np.ndarray) -> CheckerboardDetection | None:
         if gray.ndim == 3:
             gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        flags = cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_LARGER
+        if not self.fast:
+            flags |= cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
         found, corners, meta = cv2.findChessboardCornersSBWithMeta(
-            gray, self.seed,
-            flags=(cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
-                   | cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_LARGER))
+            gray, self.seed, flags=flags)
         if not found or corners is None or len(corners) < self.min_corners:
             return None
         rows, cols = meta.shape

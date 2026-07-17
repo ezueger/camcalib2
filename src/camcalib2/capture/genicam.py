@@ -91,6 +91,12 @@ class GenICamSource(FrameSource):
             self._ia = self._harvester.create(kwargs["search_key"])
         else:
             self._ia = self._harvester.create(self.index)
+        try:
+            # small buffer queue = low latency: the live loop always sees
+            # a near-current frame instead of a stale queued one
+            self._ia.num_buffers = 2
+        except Exception:
+            pass
 
         nm = self._ia.remote_device.node_map
         self._try_set(nm, "PixelFormat", self.pixel_format)

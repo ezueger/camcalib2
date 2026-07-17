@@ -12,8 +12,71 @@ from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout, QLabel,
 
 from ..calibration import CameraModel
 from ..capture.source import FrameSource
-from ..io import export_all
 from ..session import CalibrationSession, FrameFeedback, SessionConfig, SessionState
+
+
+class ExportWorker(QObject):
+    """Runs the final solve + export off the GUI thread (a fisheye
+    finish can take minutes - running it inline froze the window)."""
+
+    finished = Signal(object, dict)  # CalibrationResult, written paths
+    error = Signal(str)
+
+    def __init__(self, session: CalibrationSession, xml_path: str,
+                 camera_id: str, pixel_size_mm: float | None):
+        super().__init__()
+        self.session = session
+        self.xml_path = xml_path
+        self.camera_id = camera_id
+        self.pixel_size = pixel_size_mm
+
+    @Slot()
+    def run(self):
+        try:
+            from pathlib import Path
+            from ..io.export import (render_result_image, write_ocam_xml,
+                                     write_opencv_yaml, write_vendor_xml)
+
+            result = self.session.finish()
+            out = Path(self.xml_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            written = {}
+
+            views_points = result.used_image_points
+            views_errors = result.per_point_errors
+            views_reproj = result.used_reprojections
+            pts = np.vstack(views_points) if views_points else None
+            errs = np.concatenate(views_errors) if views_errors else None
+
+            if result.model.value == "fisheye":
+                from ..calibration.ocam import calibrate_ocam
+                ocam = calibrate_ocam(self.session.views, self.session.image_size)
+                write_ocam_xml(ocam, out, self.camera_id, points=pts)
+                written["ocam_xml"] = out
+                views_points = ocam.used_image_points
+                views_errors = ocam.per_point_errors
+                views_reproj = ocam.used_reprojections
+            else:
+                ps = ((self.pixel_size, self.pixel_size)
+                      if self.pixel_size else None)
+                write_vendor_xml(result, out, self.camera_id,
+                                 pixel_size_mm=ps, points=pts, errors=errs)
+                written["vendor_xml"] = out
+
+            yaml_path = out.with_name(f"{self.camera_id}-opencv.yaml")
+            write_opencv_yaml(result, yaml_path)
+            written["opencv_yaml"] = yaml_path
+
+            img = render_result_image(result, views_points, views_errors,
+                                      views_reproj)
+            img_path = out.with_name(f"{self.camera_id}-result.jpg")
+            import cv2 as _cv2
+            _cv2.imwrite(str(img_path), img, [_cv2.IMWRITE_JPEG_QUALITY, 92])
+            written["result_image"] = img_path
+
+            self.finished.emit(result, written)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class CaptureWorker(QObject):
@@ -86,17 +149,20 @@ class LiveView(QLabel):
             painter.end()
             return
 
-        # --- coverage veil: darken cells not yet covered
+        # --- coverage overlay: uncovered cells clearly red, covered
+        #     cells a light green tint - full coverage reads as a
+        #     uniformly light-green image
         if self._coverage_mask is not None:
             rows, cols = self._coverage_mask.shape
             cw, ch = dw / cols, dh / rows
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(10, 10, 20, 150))
+            red = QBrush(QColor(225, 45, 45, 130))
+            green = QBrush(QColor(70, 220, 120, 45))
             for r in range(rows):
                 for c in range(cols):
-                    if not self._coverage_mask[r, c]:
-                        painter.drawRect(int(ox + c * cw), int(oy + r * ch),
-                                         int(cw + 1), int(ch + 1))
+                    painter.setBrush(green if self._coverage_mask[r, c] else red)
+                    painter.drawRect(int(ox + c * cw), int(oy + r * ch),
+                                     int(cw + 1), int(ch + 1))
 
         # --- detected points
         color = QColor(80, 255, 120) if fb.keyframe else QColor(120, 220, 255)
@@ -249,32 +315,50 @@ class MainWindow(QMainWindow):
                                 "Es wurden noch nicht genug Keyframes gesammelt.")
             return
         self.stop()
-        try:
-            result = self._session.finish()
-        except Exception as e:
-            QMessageBox.critical(self, "Kalibrierung fehlgeschlagen", str(e))
+
+        # save dialog: default ~/Documents/<serial>-ocv.xml / -ocam.xml,
+        # result image and OpenCV YAML are written next to it
+        from pathlib import Path
+        suffix = "ocam" if self._session.cfg.model.value == "fisheye" else "ocv"
+        default = str(Path.home() / "Documents" / f"{self._camera_id}-{suffix}.xml")
+        xml_path, _ = QFileDialog.getSaveFileName(
+            self, "Kalibrierung exportieren", default, "XML-Datei (*.xml)")
+        if not xml_path:
             return
-        out = QFileDialog.getExistingDirectory(self, "Export-Verzeichnis wählen")
-        if not out:
-            return
-        ocam_result = None
-        if result.model is not None and result.model.value == "fisheye":
-            try:
-                from ..calibration.ocam import calibrate_ocam
-                ocam_result = calibrate_ocam(self._session.views,
-                                             self._session.image_size)
-            except Exception:
-                ocam_result = None  # KB/YAML export still succeeds
-        ps = (self._pixel_size, self._pixel_size) if self._pixel_size else None
-        written = export_all(result, out, self._camera_id,
-                             result.used_image_points, result.per_point_errors,
-                             pixel_size_mm=ps, ocam_result=ocam_result)
+
+        # final solve + export in a worker thread - the fisheye finish
+        # can take minutes and used to freeze the GUI here
+        self.btn_finish.setEnabled(False)
+        self.btn_start.setEnabled(False)
+        self.stats.setText("Finale Kalibrierung läuft …\n(kann bei Fisheye"
+                           " einige Minuten dauern)")
+        self._export_worker = ExportWorker(self._session, xml_path,
+                                           self._camera_id, self._pixel_size)
+        self._export_thread = QThread()
+        self._export_worker.moveToThread(self._export_thread)
+        self._export_thread.started.connect(self._export_worker.run)
+        self._export_worker.finished.connect(self._on_export_done)
+        self._export_worker.error.connect(self._on_export_error)
+        self._export_worker.finished.connect(self._export_thread.quit)
+        self._export_worker.error.connect(self._export_thread.quit)
+        self._export_thread.start()
+
+    @Slot(object, dict)
+    def _on_export_done(self, result, written):
+        self.btn_finish.setEnabled(True)
+        self.btn_start.setEnabled(True)
         QMessageBox.information(
             self, "Export abgeschlossen",
             f"fx={result.fx:.2f} fy={result.fy:.2f}\n"
             f"cx={result.cx:.2f} cy={result.cy:.2f}\n"
             f"RMS={result.rms:.3f} px ({result.n_views} Views)\n\n"
             + "\n".join(str(p) for p in written.values()))
+
+    @Slot(str)
+    def _on_export_error(self, msg):
+        self.btn_finish.setEnabled(True)
+        self.btn_start.setEnabled(True)
+        QMessageBox.critical(self, "Export fehlgeschlagen", msg)
 
     def closeEvent(self, event):
         self.stop()
