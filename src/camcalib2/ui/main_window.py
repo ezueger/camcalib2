@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPen,
@@ -28,6 +29,8 @@ class CaptureWorker(QObject):
         self.source = source
         self.session = session
         self._running = False
+        self._preview_lock = threading.Lock()
+        self._preview_in_flight = False
 
     @Slot()
     def run(self):
@@ -38,7 +41,8 @@ class CaptureWorker(QObject):
                 if not ok:
                     break
                 fb = self.session.process(frame, ts)
-                self.frameProcessed.emit(frame, fb)
+                if self._begin_preview_delivery():
+                    self.frameProcessed.emit(frame, fb)
         except Exception as e:  # surface errors instead of dying silently
             if self._running:
                 self.error.emit(str(e))
@@ -47,6 +51,22 @@ class CaptureWorker(QObject):
 
     def stop(self):
         self._running = False
+        self._finish_preview_delivery()
+
+    def _begin_preview_delivery(self) -> bool:
+        with self._preview_lock:
+            if self._preview_in_flight:
+                return False
+            self._preview_in_flight = True
+            return True
+
+    def _finish_preview_delivery(self):
+        with self._preview_lock:
+            self._preview_in_flight = False
+
+    @Slot()
+    def on_frame_displayed(self):
+        self._finish_preview_delivery()
 
 
 class LiveView(QLabel):
@@ -139,12 +159,18 @@ class LiveView(QLabel):
 
 
 class MainWindow(QMainWindow):
+    frameDisplayed = Signal()
+
     def __init__(self, make_source, make_session, camera_id: str = "camera",
                  pixel_size_mm: float | None = None,
                  camera_mode: bool = False,
                  list_cameras=None,
                  format_camera_label=None,
-                 initial_camera_serial: str | None = None):
+                 initial_camera_serial: str | None = None,
+                 model_options: list[tuple[str, str]] | None = None,
+                 initial_model_value: str | None = None,
+                 target_options_by_model: dict[str, list[tuple[str, str]]] | None = None,
+                 initial_target_spec: str | None = None):
         """``make_source``/``make_session`` are factories so a session can
         be restarted without rebuilding the window."""
         super().__init__()
@@ -157,7 +183,15 @@ class MainWindow(QMainWindow):
         self._list_cameras = list_cameras
         self._format_camera_label = format_camera_label or self._default_camera_label
         self._initial_camera_serial = initial_camera_serial
-        self._camera_serials: list[str | None] = []
+        self._model_options = model_options or [(CameraModel.PINHOLE.value, "Perspektivisch")]
+        self._initial_model_value = initial_model_value or self._model_options[0][0]
+        self._target_options_by_model = target_options_by_model or {
+            self._initial_model_value: [("dots", "CodeMarker | Standard")]
+        }
+        self._initial_target_spec = initial_target_spec or (
+            self._target_options_by_model[self._initial_model_value][0][0]
+        )
+        self._cameras: list[dict] = []
         self._thread: QThread | None = None
         self._worker: CaptureWorker | None = None
         self._session: CalibrationSession | None = None
@@ -170,6 +204,10 @@ class MainWindow(QMainWindow):
         self.stats.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.stats.setWordWrap(True)
         self.stats.setMinimumHeight(320)
+        self.lbl_model = QLabel("Linsenart")
+        self.cmb_model = QComboBox()
+        self.lbl_target = QLabel("Testpattern")
+        self.cmb_target = QComboBox()
         self.lbl_camera = QLabel("Kamera")
         self.cmb_camera = QComboBox()
         self.lbl_camera_status = QLabel("")
@@ -179,36 +217,42 @@ class MainWindow(QMainWindow):
         self.chk_reset_defaults.setChecked(True)
         self.chk_custom_exposure = QCheckBox("Belichtung manuell setzen")
         self.chk_custom_exposure.setChecked(True)
-        self.spn_exposure_us = QDoubleSpinBox()
-        self.spn_exposure_us.setDecimals(0)
-        self.spn_exposure_us.setRange(1, 10_000_000)
-        self.spn_exposure_us.setSingleStep(100)
-        self.spn_exposure_us.setValue(10_000)
-        self.spn_exposure_us.setSuffix(" us")
+        self.spn_exposure_ms = QDoubleSpinBox()
+        self.spn_exposure_ms.setDecimals(1)
+        self.spn_exposure_ms.setRange(0.1, 10_000.0)
+        self.spn_exposure_ms.setSingleStep(0.1)
+        self.spn_exposure_ms.setValue(10.0)
+        self.spn_exposure_ms.setSuffix(" ms")
         self.btn_start = QPushButton("Start")
         self.btn_stop = QPushButton("Stop && Kamera freigeben")
         self.btn_stop.setEnabled(False)
         self.btn_finish = QPushButton("Fertigstellen && Export")
         self.btn_finish.setEnabled(False)
+        self.cmb_model.currentIndexChanged.connect(self._on_model_changed)
+        self.cmb_target.currentIndexChanged.connect(self._on_target_changed)
         self.cmb_camera.currentIndexChanged.connect(self._on_camera_changed)
         self.btn_refresh_cameras.clicked.connect(self.refresh_cameras)
-        self.chk_custom_exposure.toggled.connect(self.spn_exposure_us.setEnabled)
+        self.chk_custom_exposure.toggled.connect(self.spn_exposure_ms.setEnabled)
         self.chk_custom_exposure.toggled.connect(lambda _checked: self._update_camera_status())
         self.chk_reset_defaults.toggled.connect(lambda _checked: self._update_camera_status())
-        self.spn_exposure_us.valueChanged.connect(lambda _value: self._update_camera_status())
+        self.spn_exposure_ms.valueChanged.connect(lambda _value: self._update_camera_status())
         self.btn_start.clicked.connect(self.start)
         self.btn_stop.clicked.connect(self.stop)
         self.btn_finish.clicked.connect(self.finish)
-        self.spn_exposure_us.setEnabled(self.chk_custom_exposure.isChecked())
+        self.spn_exposure_ms.setEnabled(self.chk_custom_exposure.isChecked())
 
         side = QVBoxLayout()
+        side.addWidget(self.lbl_model)
+        side.addWidget(self.cmb_model)
+        side.addWidget(self.lbl_target)
+        side.addWidget(self.cmb_target)
         if self._camera_mode:
             side.addWidget(self.lbl_camera)
             side.addWidget(self.cmb_camera)
             side.addWidget(self.btn_refresh_cameras)
             side.addWidget(self.chk_reset_defaults)
             side.addWidget(self.chk_custom_exposure)
-            side.addWidget(self.spn_exposure_us)
+            side.addWidget(self.spn_exposure_ms)
             side.addWidget(self.lbl_camera_status)
         side.addWidget(self.stats)
         side.addStretch(1)
@@ -225,6 +269,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         central.setLayout(lay)
         self.setCentralWidget(central)
+        self._populate_model_options()
+        self._populate_target_options()
         if self._camera_mode:
             self.refresh_cameras()
 
@@ -232,16 +278,20 @@ class MainWindow(QMainWindow):
     @Slot()
     def start(self):
         self.stop()
-        selected_serial = self._selected_camera_serial()
+        selected_camera = self._selected_camera()
         if self._camera_mode and self.cmb_camera.count() == 0:
             QMessageBox.warning(self, "Keine Kamera",
                                 "Es ist keine GigE/GenICam-Kamera ausgewaehlt.")
             return
         source_options = self._source_options()
         try:
-            self._source = self._make_source(selected_serial, source_options)
+            self._source = self._make_source(selected_camera, source_options)
             self._source.open()
-            self._session = self._make_session(self._source.image_size)
+            self._session = self._make_session(
+                self._source.image_size,
+                self._selected_target_spec(),
+                self._selected_model_value(),
+            )
         except Exception as e:
             QMessageBox.critical(self, "Fehler", str(e))
             return
@@ -253,26 +303,37 @@ class MainWindow(QMainWindow):
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._on_capture_finished)
+        self.frameDisplayed.connect(self._worker.on_frame_displayed)
         self._thread.start()
         self._capture_running = True
         self.btn_start.setText("Neu starten")
         self.btn_stop.setEnabled(True)
         self.btn_finish.setEnabled(True)
         self._set_camera_controls_enabled(False)
+        self.cmb_model.setEnabled(False)
+        self.cmb_target.setEnabled(False)
 
     def stop(self):
         was_running = self._capture_running
+        worker = self._worker
         if self._worker:
             self._worker.stop()
         self._release_source()
         if self._thread:
             self._thread.quit()
             self._thread.wait(3000)
+        if worker:
+            try:
+                self.frameDisplayed.disconnect(worker.on_frame_displayed)
+            except (RuntimeError, TypeError):
+                pass
         self._worker = self._thread = None
         self._capture_running = False
         self.btn_start.setText("Start")
         self.btn_stop.setEnabled(False)
         self._set_camera_controls_enabled(True)
+        self.cmb_model.setEnabled(True)
+        self.cmb_target.setEnabled(True)
         if was_running and self._camera_mode and self.cmb_camera.count() > 0:
             self._update_camera_status()
             self.lbl_camera_status.setText(
@@ -291,25 +352,28 @@ class MainWindow(QMainWindow):
 
     @Slot(np.ndarray, object)
     def _on_frame(self, frame, fb: FrameFeedback):
-        mask = self._session.coverage.mask() if self._session else None
-        self.view.update_frame(frame, fb, mask)
-        lines = [
-            f"Status:     {fb.state.value}",
-            f"Marker:     {len(fb.ids)}",
-            f"Keyframes:  {fb.n_keyframes}",
-            f"Abdeckung:  {fb.coverage*100:.0f} %",
-            f"Winkel:     {fb.tilt_coverage*100:.0f} %",
-        ]
-        if fb.result is not None:
-            r = fb.result
-            lines += [
-                "", "-- Intrinsiken (live) --",
-                f"fx: {r.fx:9.2f}", f"fy: {r.fy:9.2f}",
-                f"cx: {r.cx:9.2f}", f"cy: {r.cy:9.2f}",
-                f"RMS: {r.rms:7.3f} px",
-                f"Views: {r.n_views}",
+        try:
+            mask = self._session.coverage.mask() if self._session else None
+            self.view.update_frame(frame, fb, mask)
+            lines = [
+                f"Status:     {fb.state.value}",
+                f"Marker:     {len(fb.ids)}",
+                f"Keyframes:  {fb.n_keyframes}",
+                f"Abdeckung:  {fb.coverage*100:.0f} %",
+                f"Winkel:     {fb.tilt_coverage*100:.0f} %",
             ]
-        self.stats.setText("\n".join(lines))
+            if fb.result is not None:
+                r = fb.result
+                lines += [
+                    "", "-- Intrinsiken (live) --",
+                    f"fx: {r.fx:9.2f}", f"fy: {r.fy:9.2f}",
+                    f"cx: {r.cx:9.2f}", f"cy: {r.cy:9.2f}",
+                    f"RMS: {r.rms:7.3f} px",
+                    f"Views: {r.n_views}",
+                ]
+            self.stats.setText("\n".join(lines))
+        finally:
+            self.frameDisplayed.emit()
 
     @Slot(str)
     def _on_error(self, msg):
@@ -323,16 +387,45 @@ class MainWindow(QMainWindow):
         self.btn_start.setText("Start")
         self.btn_stop.setEnabled(False)
         self._set_camera_controls_enabled(True)
+        self.cmb_model.setEnabled(True)
+        self.cmb_target.setEnabled(True)
+
+    def _populate_model_options(self):
+        self.cmb_model.blockSignals(True)
+        self.cmb_model.clear()
+        selected_index = 0
+        for index, (model_value, label) in enumerate(self._model_options):
+            self.cmb_model.addItem(label, model_value)
+            if model_value == self._initial_model_value:
+                selected_index = index
+        self.cmb_model.setCurrentIndex(selected_index)
+        self.cmb_model.blockSignals(False)
+
+    def _populate_target_options(self, preferred_spec: str | None = None):
+        model_value = self._selected_model_value()
+        target_options = self._target_options_by_model.get(model_value, [])
+        self.cmb_target.blockSignals(True)
+        self.cmb_target.clear()
+        selected_index = 0
+        for index, (spec, label) in enumerate(target_options):
+            self.cmb_target.addItem(label, spec)
+            if spec == (preferred_spec or self._initial_target_spec):
+                selected_index = index
+        self.cmb_target.setCurrentIndex(selected_index)
+        self.cmb_target.blockSignals(False)
 
     @Slot()
     def refresh_cameras(self):
         if not self._camera_mode or self._list_cameras is None:
             return
-        wanted_serial = self._selected_camera_serial() or self._initial_camera_serial
+        current_camera = self._selected_camera()
+        wanted_key = self._camera_selection_key(current_camera)
+        if wanted_key is None and self._initial_camera_serial:
+            wanted_key = f"serial_number:{self._initial_camera_serial}"
         try:
             cameras = self._list_cameras()
         except Exception as e:
-            self._camera_serials = []
+            self._cameras = []
             self.cmb_camera.clear()
             self.lbl_camera_status.setText(str(e))
             self.btn_start.setEnabled(False)
@@ -340,10 +433,12 @@ class MainWindow(QMainWindow):
 
         self.cmb_camera.blockSignals(True)
         self.cmb_camera.clear()
-        self._camera_serials = []
+        self._cameras = []
         for index, camera in enumerate(cameras):
-            self.cmb_camera.addItem(self._format_camera_label(camera, index))
-            self._camera_serials.append(camera.get("serial_number") or None)
+            camera_entry = dict(camera)
+            camera_entry["camera_index"] = index
+            self.cmb_camera.addItem(self._format_camera_label(camera_entry, index))
+            self._cameras.append(camera_entry)
         self.cmb_camera.blockSignals(False)
 
         if not cameras:
@@ -352,13 +447,13 @@ class MainWindow(QMainWindow):
             return
 
         selected_index = 0
-        if wanted_serial:
-            for index, serial in enumerate(self._camera_serials):
-                if serial == wanted_serial:
+        if wanted_key:
+            for index, camera in enumerate(self._cameras):
+                if self._camera_selection_key(camera) == wanted_key:
                     selected_index = index
                     break
         self.cmb_camera.setCurrentIndex(selected_index)
-        self._initial_camera_serial = self._camera_serials[selected_index]
+        self._initial_camera_serial = self._cameras[selected_index].get("serial_number") or None
         self.btn_start.setEnabled(True)
         self._update_camera_status()
 
@@ -366,11 +461,49 @@ class MainWindow(QMainWindow):
     def _on_camera_changed(self, _index: int):
         self._update_camera_status()
 
-    def _selected_camera_serial(self) -> str | None:
+    @Slot(int)
+    def _on_model_changed(self, _index: int):
+        preferred_spec = self._recommended_target_spec_for_model(self._selected_model_value())
+        self._populate_target_options(preferred_spec=preferred_spec)
+        self._update_camera_status()
+
+    @Slot(int)
+    def _on_target_changed(self, _index: int):
+        self._update_camera_status()
+
+    def _selected_camera(self) -> dict | None:
         index = self.cmb_camera.currentIndex()
-        if 0 <= index < len(self._camera_serials):
-            return self._camera_serials[index]
-        return self._initial_camera_serial
+        if 0 <= index < len(self._cameras):
+            return self._cameras[index]
+        return None
+
+    def _selected_target_spec(self) -> str:
+        data = self.cmb_target.currentData()
+        if isinstance(data, str) and data:
+            return data
+        return self._initial_target_spec
+
+    def _selected_model_value(self) -> str:
+        data = self.cmb_model.currentData()
+        if isinstance(data, str) and data:
+            return data
+        return self._initial_model_value
+
+    @staticmethod
+    def _recommended_target_spec_for_model(model_value: str) -> str:
+        if model_value == CameraModel.FISHEYE.value:
+            return "checker:10x10:40"
+        return "dots"
+
+    @staticmethod
+    def _camera_selection_key(camera: dict | None) -> str | None:
+        if not camera:
+            return None
+        for key in ("serial_number", "ip_address", "mac_address", "display_name"):
+            value = camera.get(key)
+            if value:
+                return f"{key}:{value}"
+        return None
 
     def _update_camera_status(self):
         if not self._camera_mode:
@@ -378,13 +511,16 @@ class MainWindow(QMainWindow):
         if self.cmb_camera.count() == 0:
             self.lbl_camera_status.setText("Keine Kamera verfuegbar.")
             return
+        model_label = self.cmb_model.currentText()
         label = self.cmb_camera.currentText()
+        target_label = self.cmb_target.currentText()
         exposure = "Kamera-Default"
         if self.chk_custom_exposure.isChecked():
-            exposure = f"{self.spn_exposure_us.value():.0f} us"
+            exposure = f"{self.spn_exposure_ms.value():.1f} ms"
         reset_info = "mit Reset auf Defaults" if self.chk_reset_defaults.isChecked() else "ohne Reset"
         self.lbl_camera_status.setText(
-            f"Ausgewaehlt: {label}\nStart: {reset_info}, Belichtung {exposure}"
+            f"Linsenart: {model_label}\nPattern: {target_label}\nAusgewaehlt: {label}\n"
+            f"Start: {reset_info}, Belichtung {exposure}"
         )
 
     def _set_camera_controls_enabled(self, enabled: bool):
@@ -394,14 +530,14 @@ class MainWindow(QMainWindow):
         self.btn_refresh_cameras.setEnabled(enabled)
         self.chk_reset_defaults.setEnabled(enabled)
         self.chk_custom_exposure.setEnabled(enabled)
-        self.spn_exposure_us.setEnabled(enabled and self.chk_custom_exposure.isChecked())
+        self.spn_exposure_ms.setEnabled(enabled and self.chk_custom_exposure.isChecked())
 
     def _source_options(self) -> dict:
         if not self._camera_mode:
             return {}
         exposure_us = None
         if self.chk_custom_exposure.isChecked():
-            exposure_us = float(self.spn_exposure_us.value())
+            exposure_us = float(self.spn_exposure_ms.value()) * 1000.0
         return {
             "reset_to_defaults": self.chk_reset_defaults.isChecked(),
             "exposure_us": exposure_us,
