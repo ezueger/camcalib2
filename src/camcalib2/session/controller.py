@@ -110,11 +110,17 @@ class CalibrationSession:
         ids, pts, obj = self._detect(gray)
 
         # model-guided recovery: once a preliminary calibration exists,
-        # re-measure observations the detector missed (lens periphery!)
+        # re-measure observations the detector missed (lens periphery!).
+        # For fisheye the recovered rim points must NOT feed OpenCV's
+        # fragile KB solver - they are used for coverage/UI here and are
+        # re-recovered into the OCam bundle adjustment on export.
+        base = (ids, pts, obj)
         with self._lock:
             model_result = self._result
         if model_result is not None and len(ids) >= 8:
             ids, pts, obj = self._recover(gray, ids, pts, obj, model_result)
+        if self.cfg.model is CameraModel.PINHOLE:
+            base = (ids, pts, obj)
 
         keyframe = False
         reason = "no_target"
@@ -124,7 +130,7 @@ class CalibrationSession:
             new_cells = self.coverage.new_cells(pts)
             keyframe, reason = self.selector.consider(gray, ids, pts, timestamp, new_cells)
             if keyframe:
-                self._accept_keyframe(ids, pts, obj, timestamp)
+                self._accept_keyframe(*base, timestamp)
 
         with self._lock:
             result = self._result
