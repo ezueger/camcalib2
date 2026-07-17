@@ -45,6 +45,42 @@ pip install -e .[ui]      # + PySide6 GUI
 pip install -e .[genicam] # + GenICam/GigE Kameras (harvesters)
 ```
 
+Unter Windows legt eine Paketinstallation zusaetzlich einen nativen
+GUI-Startpunkt `camcalib2-gui` an.
+
+## Windows-Paket fuer anderen Rechner
+
+Fuer eine portable GUI-Verteilung ohne lokale Python-Installation:
+
+```powershell
+.\tools\build_windows_gui.ps1
+```
+
+Falls PowerShell lokale Skripte blockiert:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build_windows_gui.ps1
+```
+
+Danach liegen die Dateien hier:
+
+* `dist/camcalib2-gui/` mit `camcalib2-gui.exe`
+* `release/camcalib2-gui-windows.zip` zum Kopieren auf den Zielrechner
+
+Optional:
+
+```powershell
+.\tools\build_windows_gui.ps1 -OneFile
+.\tools\build_windows_gui.ps1 -IncludeGenICam
+```
+
+Hinweise:
+
+* `-OneFile` erzeugt eine einzelne EXE statt eines Verzeichnisses.
+* `-IncludeGenICam` packt die optionale `harvesters`-Unterstuetzung mit ein.
+* Fuer echte GenICam-Kameras werden auf dem Zielrechner weiterhin die
+  passenden Hersteller-SDKs bzw. `.cti`-Producer benoetigt.
+
 ## Benutzung
 
 Live mit Kamera (GUI):
