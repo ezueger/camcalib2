@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+import time
+from dataclasses import dataclass
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPen,
@@ -17,10 +19,23 @@ from ..io import export_all
 from ..session import CalibrationSession, FrameFeedback, SessionConfig, SessionState
 
 
+@dataclass(frozen=True)
+class RuntimeMetrics:
+    elapsed_s: float = 0.0
+    captured_frames: int = 0
+    displayed_frames: int = 0
+    dropped_previews: int = 0
+    capture_fps: float = 0.0
+    display_fps: float = 0.0
+    avg_process_ms: float = 0.0
+    max_process_ms: float = 0.0
+    last_process_ms: float = 0.0
+
+
 class CaptureWorker(QObject):
     """Runs the source + session loop in a QThread."""
 
-    frameProcessed = Signal(np.ndarray, object)  # gray frame, FrameFeedback
+    frameProcessed = Signal(np.ndarray, object, object)  # gray frame, FrameFeedback, RuntimeMetrics
     finished = Signal()
     error = Signal(str)
 
@@ -31,18 +46,32 @@ class CaptureWorker(QObject):
         self._running = False
         self._preview_lock = threading.Lock()
         self._preview_in_flight = False
+        self._metrics_lock = threading.Lock()
+        self._started_at = 0.0
+        self._captured_frames = 0
+        self._displayed_frames = 0
+        self._dropped_previews = 0
+        self._total_process_s = 0.0
+        self._max_process_s = 0.0
+        self._last_process_s = 0.0
 
     @Slot()
     def run(self):
         self._running = True
+        self._reset_metrics()
         try:
             while self._running:
                 ok, frame, ts = self.source.read()
                 if not ok:
                     break
+                process_started = time.perf_counter()
                 fb = self.session.process(frame, ts)
+                process_s = time.perf_counter() - process_started
+                metrics = self._record_processed_frame(process_s)
                 if self._begin_preview_delivery():
-                    self.frameProcessed.emit(frame, fb)
+                    self.frameProcessed.emit(frame, fb, metrics)
+                else:
+                    self._record_dropped_preview()
         except Exception as e:  # surface errors instead of dying silently
             if self._running:
                 self.error.emit(str(e))
@@ -66,7 +95,58 @@ class CaptureWorker(QObject):
 
     @Slot()
     def on_frame_displayed(self):
+        self._record_displayed_frame()
         self._finish_preview_delivery()
+
+    def _reset_metrics(self):
+        with self._metrics_lock:
+            self._started_at = time.perf_counter()
+            self._captured_frames = 0
+            self._displayed_frames = 0
+            self._dropped_previews = 0
+            self._total_process_s = 0.0
+            self._max_process_s = 0.0
+            self._last_process_s = 0.0
+
+    def _record_processed_frame(self, process_s: float) -> RuntimeMetrics:
+        with self._metrics_lock:
+            self._captured_frames += 1
+            self._total_process_s += process_s
+            self._last_process_s = process_s
+            if process_s > self._max_process_s:
+                self._max_process_s = process_s
+        return self.runtime_metrics()
+
+    def _record_dropped_preview(self):
+        with self._metrics_lock:
+            self._dropped_previews += 1
+
+    def _record_displayed_frame(self):
+        with self._metrics_lock:
+            self._displayed_frames += 1
+
+    def runtime_metrics(self) -> RuntimeMetrics:
+        with self._metrics_lock:
+            elapsed_s = max(time.perf_counter() - self._started_at, 1e-9)
+            captured_frames = self._captured_frames
+            displayed_frames = self._displayed_frames
+            dropped_previews = self._dropped_previews
+            total_process_s = self._total_process_s
+            max_process_s = self._max_process_s
+            last_process_s = self._last_process_s
+
+        avg_process_ms = (total_process_s / captured_frames * 1000.0) if captured_frames else 0.0
+        return RuntimeMetrics(
+            elapsed_s=elapsed_s,
+            captured_frames=captured_frames,
+            displayed_frames=displayed_frames,
+            dropped_previews=dropped_previews,
+            capture_fps=captured_frames / elapsed_s,
+            display_fps=displayed_frames / elapsed_s,
+            avg_process_ms=avg_process_ms,
+            max_process_ms=max_process_s * 1000.0,
+            last_process_ms=last_process_s * 1000.0,
+        )
 
 
 class LiveView(QLabel):
@@ -197,6 +277,7 @@ class MainWindow(QMainWindow):
         self._session: CalibrationSession | None = None
         self._source: FrameSource | None = None
         self._capture_running = False
+        self._last_stats_update = 0.0
 
         self.view = LiveView()
         self.stats = QLabel("-")
@@ -350,28 +431,39 @@ class MainWindow(QMainWindow):
             finally:
                 self._source = None
 
-    @Slot(np.ndarray, object)
-    def _on_frame(self, frame, fb: FrameFeedback):
+    @Slot(np.ndarray, object, object)
+    def _on_frame(self, frame, fb: FrameFeedback, metrics: RuntimeMetrics):
         try:
             mask = self._session.coverage.mask() if self._session else None
             self.view.update_frame(frame, fb, mask)
-            lines = [
-                f"Status:     {fb.state.value}",
-                f"Marker:     {len(fb.ids)}",
-                f"Keyframes:  {fb.n_keyframes}",
-                f"Abdeckung:  {fb.coverage*100:.0f} %",
-                f"Winkel:     {fb.tilt_coverage*100:.0f} %",
-            ]
-            if fb.result is not None:
-                r = fb.result
-                lines += [
-                    "", "-- Intrinsiken (live) --",
-                    f"fx: {r.fx:9.2f}", f"fy: {r.fy:9.2f}",
-                    f"cx: {r.cx:9.2f}", f"cy: {r.cy:9.2f}",
-                    f"RMS: {r.rms:7.3f} px",
-                    f"Views: {r.n_views}",
+            now = time.perf_counter()
+            if now - self._last_stats_update >= 0.25:
+                lines = [
+                    f"Status:     {fb.state.value}",
+                    f"Marker:     {len(fb.ids)}",
+                    f"Keyframes:  {fb.n_keyframes}",
+                    f"Abdeckung:  {fb.coverage*100:.0f} %",
+                    f"Winkel:     {fb.tilt_coverage*100:.0f} %",
+                    "",
+                    "-- Laufzeit --",
+                    f"Laufzeit:   {metrics.elapsed_s:7.1f} s",
+                    f"Erfasst:    {metrics.captured_frames:7d} ({metrics.capture_fps:4.1f} fps)",
+                    f"Anzeige:    {metrics.displayed_frames:7d} ({metrics.display_fps:4.1f} fps)",
+                    f"Drops:      {metrics.dropped_previews:7d}",
+                    f"Process:    {metrics.last_process_ms:7.1f} ms | avg {metrics.avg_process_ms:5.1f}",
+                    f"Peak:       {metrics.max_process_ms:7.1f} ms",
                 ]
-            self.stats.setText("\n".join(lines))
+                if fb.result is not None:
+                    r = fb.result
+                    lines += [
+                        "", "-- Intrinsiken (live) --",
+                        f"fx: {r.fx:9.2f}", f"fy: {r.fy:9.2f}",
+                        f"cx: {r.cx:9.2f}", f"cy: {r.cy:9.2f}",
+                        f"RMS: {r.rms:7.3f} px",
+                        f"Views: {r.n_views}",
+                    ]
+                self.stats.setText("\n".join(lines))
+                self._last_stats_update = now
         finally:
             self.frameDisplayed.emit()
 

@@ -1,3 +1,7 @@
+import time
+
+import pytest
+
 from camcalib2.ui.main_window import CaptureWorker
 from camcalib2.patterns.board import Checkerboard
 from camcalib2.patterns.board import MarkerBoard
@@ -56,3 +60,33 @@ def test_capture_worker_allows_only_one_preview_in_flight():
     assert worker._begin_preview_delivery() is False
     worker.on_frame_displayed()
     assert worker._begin_preview_delivery() is True
+
+
+def test_capture_worker_runtime_metrics_track_processing_and_display():
+    worker = CaptureWorker(source=None, session=None)
+    worker._reset_metrics()
+    time.sleep(0.01)
+
+    metrics = worker._record_processed_frame(0.012)
+    worker.on_frame_displayed()
+    metrics = worker.runtime_metrics()
+
+    assert metrics.captured_frames == 1
+    assert metrics.displayed_frames == 1
+    assert metrics.dropped_previews == 0
+    assert metrics.last_process_ms == pytest.approx(12.0)
+    assert metrics.avg_process_ms == pytest.approx(12.0)
+    assert metrics.max_process_ms == pytest.approx(12.0)
+    assert metrics.elapsed_s > 0.0
+
+
+def test_capture_worker_runtime_metrics_count_dropped_previews():
+    worker = CaptureWorker(source=None, session=None)
+    worker._reset_metrics()
+
+    assert worker._begin_preview_delivery() is True
+    worker._record_dropped_preview()
+    metrics = worker.runtime_metrics()
+
+    assert metrics.dropped_previews == 1
+    assert metrics.displayed_frames == 0
