@@ -1,8 +1,14 @@
 import time
 
+import numpy as np
 import pytest
+from PySide6.QtWidgets import QApplication
 
+from camcalib2.session import FrameFeedback
+from camcalib2.session import SessionState
 from camcalib2.ui.main_window import CaptureWorker
+from camcalib2.ui.main_window import MainWindow
+from camcalib2.ui.main_window import RuntimeMetrics
 from camcalib2.patterns.board import Checkerboard
 from camcalib2.patterns.board import MarkerBoard
 from camcalib2.ui.app import _default_target_spec_for_model
@@ -90,3 +96,48 @@ def test_capture_worker_runtime_metrics_count_dropped_previews():
 
     assert metrics.dropped_previews == 1
     assert metrics.displayed_frames == 0
+
+
+def test_main_window_on_frame_releases_preview_directly():
+    app = QApplication.instance() or QApplication([])
+
+    class _Coverage:
+        @staticmethod
+        def mask():
+            return np.zeros((2, 2), dtype=bool)
+
+    class _Session:
+        coverage = _Coverage()
+
+    class _Worker:
+        def __init__(self):
+            self.calls = 0
+
+        def on_frame_displayed(self):
+            self.calls += 1
+
+        def stop(self):
+            pass
+
+    win = MainWindow(lambda *_args, **_kwargs: None, lambda *_args, **_kwargs: None)
+    win._session = _Session()
+    win._worker = _Worker()
+
+    fb = FrameFeedback(
+        ids=[],
+        points=np.empty((0, 2), dtype=np.float32),
+        keyframe=False,
+        reason="no_target",
+        state=SessionState.WAITING,
+        coverage=0.0,
+        tilt_coverage=0.0,
+        n_keyframes=0,
+        rms=None,
+        result=None,
+        progress=0.0,
+    )
+    win._on_frame(np.zeros((4, 4), dtype=np.uint8), fb, RuntimeMetrics())
+
+    assert win._worker.calls == 1
+    win.close()
+    app.processEvents()

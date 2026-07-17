@@ -239,8 +239,6 @@ class LiveView(QLabel):
 
 
 class MainWindow(QMainWindow):
-    frameDisplayed = Signal()
-
     def __init__(self, make_source, make_session, camera_id: str = "camera",
                  pixel_size_mm: float | None = None,
                  camera_mode: bool = False,
@@ -384,9 +382,9 @@ class MainWindow(QMainWindow):
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._on_capture_finished)
-        self.frameDisplayed.connect(self._worker.on_frame_displayed)
         self._thread.start()
         self._capture_running = True
+        self._last_stats_update = 0.0
         self.btn_start.setText("Neu starten")
         self.btn_stop.setEnabled(True)
         self.btn_finish.setEnabled(True)
@@ -403,11 +401,6 @@ class MainWindow(QMainWindow):
         if self._thread:
             self._thread.quit()
             self._thread.wait(3000)
-        if worker:
-            try:
-                self.frameDisplayed.disconnect(worker.on_frame_displayed)
-            except (RuntimeError, TypeError):
-                pass
         self._worker = self._thread = None
         self._capture_running = False
         self.btn_start.setText("Start")
@@ -439,33 +432,28 @@ class MainWindow(QMainWindow):
             now = time.perf_counter()
             if now - self._last_stats_update >= 0.25:
                 lines = [
-                    f"Status:     {fb.state.value}",
-                    f"Marker:     {len(fb.ids)}",
-                    f"Keyframes:  {fb.n_keyframes}",
-                    f"Abdeckung:  {fb.coverage*100:.0f} %",
-                    f"Winkel:     {fb.tilt_coverage*100:.0f} %",
-                    "",
-                    "-- Laufzeit --",
-                    f"Laufzeit:   {metrics.elapsed_s:7.1f} s",
-                    f"Erfasst:    {metrics.captured_frames:7d} ({metrics.capture_fps:4.1f} fps)",
-                    f"Anzeige:    {metrics.displayed_frames:7d} ({metrics.display_fps:4.1f} fps)",
-                    f"Drops:      {metrics.dropped_previews:7d}",
-                    f"Process:    {metrics.last_process_ms:7.1f} ms | avg {metrics.avg_process_ms:5.1f}",
-                    f"Peak:       {metrics.max_process_ms:7.1f} ms",
+                    f"Status {fb.state.value} | Marker {len(fb.ids)} | KF {fb.n_keyframes}",
+                    f"Abd {fb.coverage*100:.0f}% | Winkel {fb.tilt_coverage*100:.0f}%",
+                    f"Laufz {metrics.elapsed_s:6.1f}s | Cap {metrics.capture_fps:4.1f} fps | UI {metrics.display_fps:4.1f} fps",
+                    f"Frames {metrics.captured_frames}/{metrics.displayed_frames} | Drops {metrics.dropped_previews}",
+                    f"Proc {metrics.last_process_ms:6.1f} ms | Avg {metrics.avg_process_ms:5.1f} | Peak {metrics.max_process_ms:6.1f}",
                 ]
                 if fb.result is not None:
                     r = fb.result
                     lines += [
-                        "", "-- Intrinsiken (live) --",
-                        f"fx: {r.fx:9.2f}", f"fy: {r.fy:9.2f}",
-                        f"cx: {r.cx:9.2f}", f"cy: {r.cy:9.2f}",
-                        f"RMS: {r.rms:7.3f} px",
-                        f"Views: {r.n_views}",
+                        "",
+                        f"fx {r.fx:8.2f} | fy {r.fy:8.2f} | RMS {r.rms:6.3f} px",
+                        f"cx {r.cx:8.2f} | cy {r.cy:8.2f} | Views {r.n_views}",
                     ]
                 self.stats.setText("\n".join(lines))
                 self._last_stats_update = now
         finally:
-            self.frameDisplayed.emit()
+            # Call directly from the UI thread: queued delivery back into the
+            # worker thread would stall because the capture loop keeps that
+            # thread busy and the release signal would never be processed.
+            worker = self._worker
+            if worker is not None:
+                worker.on_frame_displayed()
 
     @Slot(str)
     def _on_error(self, msg):
