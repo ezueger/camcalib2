@@ -233,16 +233,40 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
         K, D = result[1], result[2]
     rms, K, D, rvecs, tvecs, per_view, per_point, per_reproj = result
 
-    # 3) iteratively drop poisoned views (typically stuck extrinsics)
+    # 3) iteratively drop poisoned views (stuck extrinsics show up with
+    #    catastrophic per-view rms; moderate errors are handled at the
+    #    point level below so rim-heavy views survive)
     for _ in range(6):
         med = float(np.median(per_view))
-        thr = max(4.0 * med, 2.0)
+        thr = max(4.0 * med, 10.0)
         keep = [i for i, e in enumerate(per_view) if e <= thr]
         if len(keep) == len(usable) or len(keep) < 3:
             break
         usable = [usable[i] for i in keep]
         rms, K, D, rvecs, tvecs, per_view, per_point, per_reproj = _fisheye_joint(
             usable, image_size, K, D)
+
+    # 4) point-level outlier rejection (mirrors the pinhole path): drop
+    #    individual bad observations instead of whole views, re-solve
+    thr_pt = max(3.0 * rms, 2.0)
+    cleaned = []
+    dropped = 0
+    for v, err in zip(usable, per_point):
+        keep = err < thr_pt
+        dropped += int((~keep).sum())
+        if keep.sum() >= MIN_POINTS_PER_VIEW:
+            cleaned.append(ViewObservation(
+                v.image_points[keep], v.object_points[keep],
+                marker_ids=[m for m, k in zip(v.marker_ids, keep) if k]
+                if v.marker_ids else None,
+                timestamp=v.timestamp))
+    if dropped and len(cleaned) >= 3:
+        try:
+            (rms, K, D, rvecs, tvecs, per_view, per_point,
+             per_reproj) = _fisheye_joint(cleaned, image_size, K, D)
+            usable = cleaned
+        except cv2.error:
+            pass  # keep the previous solution
 
     rms = float(np.sqrt(np.mean(np.concatenate(per_point) ** 2)))
     return CalibrationResult(
