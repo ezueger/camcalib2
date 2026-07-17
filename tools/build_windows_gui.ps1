@@ -13,6 +13,7 @@ if (-not (Test-Path $python)) {
     throw "Python in .venv nicht gefunden: $python"
 }
 
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function New-ZipFromArtifact {

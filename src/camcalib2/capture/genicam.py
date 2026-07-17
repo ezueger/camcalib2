@@ -49,6 +49,7 @@ class GenICamSource(FrameSource):
     def __init__(self, cti_files: list[str] | None = None,
                  serial: str | None = None, index: int = 0,
                  pixel_format: str = "Mono8",
+                 reset_to_defaults: bool = False,
                  exposure_us: float | None = None,
                  gain_db: float | None = None,
                  fps: float | None = None):
@@ -56,6 +57,7 @@ class GenICamSource(FrameSource):
         self.serial = serial
         self.index = index
         self.pixel_format = pixel_format
+        self.reset_to_defaults = reset_to_defaults
         self.exposure_us = exposure_us
         self.gain_db = gain_db
         self.fps = fps
@@ -93,6 +95,9 @@ class GenICamSource(FrameSource):
             self._ia = self._harvester.create(self.index)
 
         nm = self._ia.remote_device.node_map
+        if self.reset_to_defaults:
+            self._load_default_user_set(nm)
+        # Keep the runtime stream predictable for the app even after a reset.
         self._try_set(nm, "PixelFormat", self.pixel_format)
         if self.exposure_us is not None:
             self._try_set(nm, "ExposureAuto", "Off")
@@ -117,6 +122,46 @@ class GenICamSource(FrameSource):
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _try_command(node_map, name: str) -> bool:
+        try:
+            getattr(node_map, name).execute()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _default_user_set_candidates(default_selector: str | None) -> list[str]:
+        candidates = []
+        if default_selector:
+            candidates.append(default_selector)
+        for candidate in ("Default", "Factory"):
+            if candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    @classmethod
+    def _load_default_user_set(cls, node_map) -> bool:
+        default_selector = None
+        try:
+            default_selector = str(getattr(node_map, "UserSetDefaultSelector").value)
+        except Exception:
+            default_selector = None
+        for selector in cls._default_user_set_candidates(default_selector):
+            if not cls._try_set(node_map, "UserSetSelector", selector):
+                continue
+            if cls._try_command(node_map, "UserSetLoad"):
+                return True
+        return False
+
+    @staticmethod
+    def _safe_device_info_value(device_info, attribute: str, default: str = "") -> str:
+        try:
+            value = getattr(device_info, attribute)
+        except Exception:
+            return default
+        return default if value is None else value
 
     # ------------------------------------------------------------------
     def read(self):
@@ -157,9 +202,12 @@ class GenICamSource(FrameSource):
         out = []
         for d in h.device_info_list:
             out.append({
-                "vendor": getattr(d, "vendor", ""),
-                "model": getattr(d, "model", ""),
-                "serial_number": getattr(d, "serial_number", ""),
+                "vendor": GenICamSource._safe_device_info_value(d, "vendor"),
+                "model": GenICamSource._safe_device_info_value(d, "model"),
+                "serial_number": GenICamSource._safe_device_info_value(d, "serial_number"),
+                "user_defined_name": GenICamSource._safe_device_info_value(d, "user_defined_name"),
+                "display_name": GenICamSource._safe_device_info_value(d, "display_name"),
+                "tl_type": GenICamSource._safe_device_info_value(d, "tl_type"),
             })
         h.reset()
         return out
