@@ -48,6 +48,8 @@ class CalibrationResult:
     per_point_errors: list[np.ndarray] = field(default_factory=list)
     #: image points of the views actually used (aligned with per_point_errors)
     used_image_points: list[np.ndarray] = field(default_factory=list)
+    #: model reprojections per used view (aligned with used_image_points)
+    used_reprojections: list[np.ndarray] = field(default_factory=list)
 
     @property
     def fx(self) -> float:
@@ -99,7 +101,7 @@ def _calibrate_pinhole(views, image_size, reject_outliers) -> CalibrationResult:
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         obj, img, image_size, K, dist, flags=cv2.CALIB_USE_INTRINSIC_GUESS)
 
-    per_view, per_point = _pinhole_errors(views, K, dist, rvecs, tvecs)
+    per_view, per_point, per_reproj = _pinhole_errors(views, K, dist, rvecs, tvecs)
 
     if reject_outliers:
         # drop points with reprojection error > max(3*rms, 2px), recalibrate
@@ -120,7 +122,7 @@ def _calibrate_pinhole(views, image_size, reject_outliers) -> CalibrationResult:
             img = [v.image_points.reshape(-1, 1, 2) for v in views]
             rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
                 obj, img, image_size, K, dist, flags=cv2.CALIB_USE_INTRINSIC_GUESS)
-            per_view, per_point = _pinhole_errors(views, K, dist, rvecs, tvecs)
+            per_view, per_point, per_reproj = _pinhole_errors(views, K, dist, rvecs, tvecs)
 
     return CalibrationResult(
         model=CameraModel.PINHOLE, image_size=tuple(image_size),
@@ -128,17 +130,20 @@ def _calibrate_pinhole(views, image_size, reject_outliers) -> CalibrationResult:
         per_view_rms=per_view, n_views=len(views),
         n_points=sum(len(v) for v in views),
         rvecs=list(rvecs), tvecs=list(tvecs), per_point_errors=per_point,
-        used_image_points=[v.image_points for v in views])
+        used_image_points=[v.image_points for v in views],
+        used_reprojections=per_reproj)
 
 
 def _pinhole_errors(views, K, dist, rvecs, tvecs):
-    per_view, per_point = [], []
+    per_view, per_point, per_reproj = [], [], []
     for v, r, t in zip(views, rvecs, tvecs):
         proj, _ = cv2.projectPoints(v.object_points, r, t, K, dist)
-        err = np.linalg.norm(proj.reshape(-1, 2) - v.image_points, axis=1)
+        proj = proj.reshape(-1, 2)
+        err = np.linalg.norm(proj - v.image_points, axis=1)
         per_point.append(err)
+        per_reproj.append(proj)
         per_view.append(float(np.sqrt(np.mean(err ** 2))))
-    return per_view, per_point
+    return per_view, per_point, per_reproj
 
 
 # ----------------------------------------------------------------------
@@ -161,14 +166,16 @@ def _fisheye_joint(views, image_size, K0, D0):
     rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
         obj, img, image_size, K0.copy(), D0.copy(),
         flags=_fisheye_flags(), criteria=_FISHEYE_CRIT)
-    per_view, per_point = [], []
+    per_view, per_point, per_reproj = [], [], []
     for v, r, t in zip(views, rvecs, tvecs):
         proj, _ = cv2.fisheye.projectPoints(
             v.object_points.reshape(1, -1, 3).astype(np.float64), r, t, K, D)
-        err = np.linalg.norm(proj.reshape(-1, 2) - v.image_points, axis=1)
+        proj = proj.reshape(-1, 2)
+        err = np.linalg.norm(proj - v.image_points, axis=1)
         per_point.append(err)
+        per_reproj.append(proj)
         per_view.append(float(np.sqrt(np.mean(err ** 2))))
-    return rms, K, D, rvecs, tvecs, per_view, per_point
+    return rms, K, D, rvecs, tvecs, per_view, per_point, per_reproj
 
 
 def _calibrate_fisheye(views, image_size) -> CalibrationResult:
@@ -224,7 +231,7 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
         usable.append(v)
         result = cand
         K, D = result[1], result[2]
-    rms, K, D, rvecs, tvecs, per_view, per_point = result
+    rms, K, D, rvecs, tvecs, per_view, per_point, per_reproj = result
 
     # 3) iteratively drop poisoned views (typically stuck extrinsics)
     for _ in range(6):
@@ -234,7 +241,7 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
         if len(keep) == len(usable) or len(keep) < 3:
             break
         usable = [usable[i] for i in keep]
-        rms, K, D, rvecs, tvecs, per_view, per_point = _fisheye_joint(
+        rms, K, D, rvecs, tvecs, per_view, per_point, per_reproj = _fisheye_joint(
             usable, image_size, K, D)
 
     rms = float(np.sqrt(np.mean(np.concatenate(per_point) ** 2)))
@@ -244,4 +251,5 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
         rms=rms, per_view_rms=per_view, n_views=len(usable),
         n_points=sum(len(v) for v in usable),
         rvecs=list(rvecs), tvecs=list(tvecs), per_point_errors=per_point,
-        used_image_points=[v.image_points for v in usable])
+        used_image_points=[v.image_points for v in usable],
+        used_reprojections=per_reproj)

@@ -27,8 +27,13 @@ from .session.keyframes import KeyframePolicy
 def parse_target(spec: str):
     if spec in ("dots", "markers"):
         return MarkerBoard.builtin()
+    if spec in ("dots:auto", "auto"):
+        return "auto"
     if spec.startswith("dots:"):
-        return MarkerBoard.from_json(spec.split(":", 1)[1])
+        ref = spec.split(":", 1)[1]
+        if ref in MarkerBoard.builtin_names():
+            return MarkerBoard.builtin(ref)
+        return MarkerBoard.from_json(ref)
     if spec.startswith("checker"):
         # checker:<cols>x<rows>:<square_mm>
         parts = spec.split(":")
@@ -46,7 +51,9 @@ def main(argv=None) -> int:
     src.add_argument("--video", help="video file of the scan")
     ap.add_argument("--pattern", default="*.jpg", help="image glob (with --images)")
     ap.add_argument("--target", type=parse_target, default="dots",
-                    help="dots | dots:<board.json> | checker:<cols>x<rows>:<square_mm>")
+                    help="dots | dots:auto | dots:<builtin-name|board.json> | "
+                         "checker:<cols>x<rows>:<square_mm>  "
+                         f"(builtin: {', '.join(MarkerBoard.builtin_names())})")
     ap.add_argument("--model", choices=[m.value for m in CameraModel], default="pinhole")
     ap.add_argument("--camera-id", default="camera")
     ap.add_argument("--pixel-size", type=float, default=None,
@@ -61,6 +68,21 @@ def main(argv=None) -> int:
 
     with source:
         w, h = source.image_size
+        if args.target == "auto":
+            import cv2 as _cv2
+            from .detection import identify_board
+            ok, frame, _ = source.read()
+            if not ok:
+                print("no frames available", file=sys.stderr)
+                return 1
+            board, n = identify_board(frame)
+            if board is None:
+                print("could not identify a known marker board", file=sys.stderr)
+                return 1
+            print(f"identified board: {board.name} ({n} markers)")
+            args.target = board
+            source.close()
+            source.open()
         cfg = SessionConfig(model=CameraModel(args.model))
         if args.all_frames:
             cfg.keyframe_policy = KeyframePolicy(

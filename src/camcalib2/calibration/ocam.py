@@ -128,6 +128,7 @@ class OcamCalibrationResult:
     tvecs: list[np.ndarray]
     per_point_errors: list[np.ndarray] = field(default_factory=list)
     used_image_points: list[np.ndarray] = field(default_factory=list)
+    used_reprojections: list[np.ndarray] = field(default_factory=list)
     #: the Kannala-Brandt bootstrap result (for comparison/diagnostics)
     kb: CalibrationResult | None = None
 
@@ -207,12 +208,14 @@ def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
                         verbose=0)
 
     m, exts = unpack(sol.x)
-    per_view_rms, per_point, rvecs, tvecs = [], [], [], []
+    per_view_rms, per_point, per_reproj, rvecs, tvecs = [], [], [], [], []
     for i, v in enumerate(used_views):
         R, _ = cv2.Rodrigues(exts[i, :3])
         pc = v.object_points.astype(np.float64) @ R.T + exts[i, 3:]
-        err = np.linalg.norm(m.world2cam(pc) - v.image_points, axis=1)
+        proj = m.world2cam(pc)
+        err = np.linalg.norm(proj - v.image_points, axis=1)
         per_point.append(err)
+        per_reproj.append(proj)
         per_view_rms.append(float(np.sqrt(np.mean(err ** 2))))
         rvecs.append(exts[i, :3].reshape(3, 1))
         tvecs.append(exts[i, 3:].reshape(3, 1))
@@ -222,7 +225,8 @@ def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
         model=m, rms=rms, per_view_rms=per_view_rms,
         n_views=n_views, n_points=int(offsets[-1]),
         rvecs=rvecs, tvecs=tvecs, per_point_errors=per_point,
-        used_image_points=[v.image_points for v in used_views], kb=kb)
+        used_image_points=[v.image_points for v in used_views],
+        used_reprojections=per_reproj, kb=kb)
 
 
 def _kb_theta_max(kb: CalibrationResult) -> float:

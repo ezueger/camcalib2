@@ -11,10 +11,15 @@ im Hintergrund mit — mit Live-Feedback wie beim Einrichten von FaceTime.
 
 ## Features
 
-* **Coded-Dot-Marker-Board** (Format der Bestandssoftware, vollständig
-  reverse-engineered, siehe [docs/MARKER_CODE.md](docs/MARKER_CODE.md)):
+* **Coded-Dot-Marker-Boards** (Format der Bestandssoftware, vollständig
+  reverse-engineered und gegen die Original-Druckvorlage verifiziert,
+  siehe [docs/MARKER_CODE.md](docs/MARKER_CODE.md)):
   rotationsinvariante Dekodierung, Subpixel-Zentren (~0.15 px),
   nutzt die vermessenen 3D-Koordinaten inkl. Board-Unebenheit.
+  Alle 8 Board-Definitionen der Bestandssoftware sind eingebaut
+  (`--target dots:<name>`), inklusive automatischer Board-Erkennung
+  (`--target dots:auto`, unterscheidet auch baugleiche Drucke anhand
+  ihrer Vermessung).
 * **Checkerboard** für Fisheye: Teilgitter-Erkennung
   (`findChessboardCornersSB` + Meta), Board darf den Bildkreis verlassen.
 * **Kalibriermodelle**: OpenCV Pinhole (5 Koeffizienten) und
