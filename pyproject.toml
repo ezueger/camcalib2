@@ -18,10 +18,14 @@ dependencies = [
 ui = ["PySide6>=6.5"]
 genicam = ["harvesters>=1.4"]
 dev = ["pytest>=7", "opencv-python-headless>=4.8"]
+build = ["PyInstaller>=6.0"]
 
 [project.scripts]
 camcalib2 = "camcalib2.ui.app:main"
 camcalib2-calibrate = "camcalib2.cli:main"
+
+[project.gui-scripts]
+camcalib2-gui = "camcalib2.ui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
