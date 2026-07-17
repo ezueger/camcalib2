@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Camcalib2 CLI",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "camcalib2.cli",
+            "cwd": "${workspaceFolder}/..",
+            "args": [
+                "--help"
+            ],
+            "console": "integratedTerminal"
+        }
+        {
+            "name": "Camcalib2 GUI",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "camcalib2.ui.app",
+            "cwd": "${workspaceFolder}/..",
+            "args": [
+                "--images", "${workspaceFolder}/../aufnahmen",
+                "--target", "dots",
+                "--model", "pinhole"
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}
