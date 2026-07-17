@@ -265,3 +265,9 @@ class CalibrationSession:
             self._result = result
         self.state = SessionState.FINISHED
         return result
+
+    def resume(self) -> None:
+        """Continue scanning after a finish() - keyframes, coverage and
+        the current calibration are kept, new keyframes improve them."""
+        if self.state in (SessionState.FINISHED, SessionState.CONVERGED):
+            self.state = SessionState.SCANNING

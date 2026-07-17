@@ -11,75 +11,81 @@ from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPen,
                            QPixmap)
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QHBoxLayout, QLabel, QMainWindow,
-                               QMessageBox, QPushButton, QVBoxLayout, QWidget)
+                               QMessageBox, QPushButton, QStackedWidget,
+                               QVBoxLayout, QWidget)
 
 from ..calibration import CameraModel
 from ..capture.source import FrameSource
 from ..session import CalibrationSession, FrameFeedback, SessionConfig, SessionState
 
 
-class ExportWorker(QObject):
-    """Runs the final solve + export off the GUI thread (a fisheye
-    finish can take minutes - running it inline froze the window)."""
+class SolveWorker(QObject):
+    """Runs the final solve off the GUI thread (a fisheye finish can
+    take minutes - running it inline froze the window). Computes the
+    calibration + the traffic-light coverage map; writes no files."""
 
-    finished = Signal(object, dict)  # CalibrationResult, written paths
+    finished = Signal(object, object, object)  # result, ocam_result|None, map(np.ndarray BGR)
     error = Signal(str)
 
-    def __init__(self, session: CalibrationSession, xml_path: str,
-                 camera_id: str, pixel_size_mm: float | None):
+    def __init__(self, session: CalibrationSession):
         super().__init__()
         self.session = session
-        self.xml_path = xml_path
-        self.camera_id = camera_id
-        self.pixel_size = pixel_size_mm
 
     @Slot()
     def run(self):
         try:
-            from pathlib import Path
-            from ..io.export import (render_result_image, write_ocam_xml,
-                                     write_opencv_yaml, write_vendor_xml)
+            from ..io.export import render_result_image
 
             result = self.session.finish()
-            out = Path(self.xml_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            written = {}
-
+            ocam = None
             views_points = result.used_image_points
             views_errors = result.per_point_errors
             views_reproj = result.used_reprojections
-            pts = np.vstack(views_points) if views_points else None
-            errs = np.concatenate(views_errors) if views_errors else None
-
             if result.model.value == "fisheye":
                 from ..calibration.ocam import calibrate_ocam
                 ocam = calibrate_ocam(self.session.views, self.session.image_size)
-                write_ocam_xml(ocam, out, self.camera_id, points=pts)
-                written["ocam_xml"] = out
                 views_points = ocam.used_image_points
                 views_errors = ocam.per_point_errors
                 views_reproj = ocam.used_reprojections
-            else:
-                ps = ((self.pixel_size, self.pixel_size)
-                      if self.pixel_size else None)
-                write_vendor_xml(result, out, self.camera_id,
-                                 pixel_size_mm=ps, points=pts, errors=errs)
-                written["vendor_xml"] = out
-
-            yaml_path = out.with_name(f"{self.camera_id}-opencv.yaml")
-            write_opencv_yaml(result, yaml_path)
-            written["opencv_yaml"] = yaml_path
-
             img = render_result_image(result, views_points, views_errors,
                                       views_reproj)
-            img_path = out.with_name(f"{self.camera_id}-result.jpg")
-            import cv2 as _cv2
-            _cv2.imwrite(str(img_path), img, [_cv2.IMWRITE_JPEG_QUALITY, 92])
-            written["result_image"] = img_path
-
-            self.finished.emit(result, written)
+            self.finished.emit(result, ocam, img)
         except Exception as e:
             self.error.emit(str(e))
+
+
+def write_calibration_files(result, ocam_result, xml_path: str,
+                            camera_id: str, pixel_size_mm: float | None,
+                            result_map) -> dict:
+    """Write the already-computed calibration next to the chosen XML path."""
+    from pathlib import Path
+    import cv2 as _cv2
+    from ..io.export import (write_ocam_xml, write_opencv_yaml,
+                             write_vendor_xml)
+
+    out = Path(xml_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    written = {}
+    pts = np.vstack(result.used_image_points) if result.used_image_points else None
+    errs = (np.concatenate(result.per_point_errors)
+            if result.per_point_errors else None)
+    if ocam_result is not None:
+        opts = (np.vstack(ocam_result.used_image_points)
+                if ocam_result.used_image_points else pts)
+        write_ocam_xml(ocam_result, out, camera_id, points=opts)
+        written["ocam_xml"] = out
+    else:
+        ps = (pixel_size_mm, pixel_size_mm) if pixel_size_mm else None
+        write_vendor_xml(result, out, camera_id, pixel_size_mm=ps,
+                         points=pts, errors=errs)
+        written["vendor_xml"] = out
+    yaml_path = out.with_name(f"{camera_id}-opencv.yaml")
+    write_opencv_yaml(result, yaml_path)
+    written["opencv_yaml"] = yaml_path
+    img_path = out.with_name(f"{camera_id}-result.jpg")
+    _cv2.imwrite(str(img_path), result_map, [_cv2.IMWRITE_JPEG_QUALITY, 92])
+    written["result_image"] = img_path
+    return written
 
 
 @dataclass(frozen=True)
@@ -304,6 +310,68 @@ class LiveView(QLabel):
         return "Weiter abtasten - Ecken und Ränder nicht vergessen"
 
 
+class ResultView(QWidget):
+    """Post-scan review page: traffic-light coverage/error map with the
+    calibration summary. Green = good, used observations; red = bad."""
+
+    backToScan = Signal()
+    finishExport = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self._pixmap: QPixmap | None = None
+        self.image = QLabel("")
+        self.image.setAlignment(Qt.AlignCenter)
+        self.image.setMinimumSize(640, 480)
+        self.image.setStyleSheet("background-color: #101014;")
+        self.summary = QLabel("")
+        self.summary.setStyleSheet("font-family: monospace; padding: 6px;")
+        self.summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.btn_back = QPushButton("Back to Scan")
+        self.btn_export = QPushButton("Finish and Create Calibrationfile")
+        self.btn_back.clicked.connect(self.backToScan.emit)
+        self.btn_export.clicked.connect(self.finishExport.emit)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.btn_back)
+        buttons.addStretch(1)
+        buttons.addWidget(self.btn_export)
+        lay = QVBoxLayout()
+        lay.addWidget(self.image, 1)
+        lay.addWidget(self.summary)
+        lay.addLayout(buttons)
+        self.setLayout(lay)
+
+    def set_result(self, result, ocam_result, bgr_map: np.ndarray):
+        h, w = bgr_map.shape[:2]
+        qimg = QImage(bgr_map.data, w, h, bgr_map.strides[0],
+                      QImage.Format_BGR888)
+        self._pixmap = QPixmap.fromImage(qimg.copy())
+        self._rescale()
+        errs = (np.concatenate(result.per_point_errors)
+                if result.per_point_errors else np.empty(0))
+        good = int((errs <= 1.0).sum())
+        bad = int((errs > 2.0).sum())
+        rms = ocam_result.rms if ocam_result is not None else result.rms
+        model = "OCam (Fisheye)" if ocam_result is not None else "Pinhole"
+        self.summary.setText(
+            f"Modell: {model}   Views: {result.n_views}   "
+            f"Punkte: {len(errs)}  (gut <=1px: {good}, schlecht >2px: {bad})\n"
+            f"fx={result.fx:.2f}  fy={result.fy:.2f}  "
+            f"cx={result.cx:.2f}  cy={result.cy:.2f}   RMS={rms:.3f} px\n"
+            f"Grün = gute, verwendete Punkte - Rot = schlechte Punkte. "
+            f"Dünn besetzte/rote Zonen? -> Back to Scan und dort nachscannen.")
+
+    def _rescale(self):
+        if self._pixmap is not None:
+            self.image.setPixmap(self._pixmap.scaled(
+                self.image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, make_source, make_session, camera_id: str = "camera",
                  pixel_size_mm: float | None = None,
@@ -342,8 +410,16 @@ class MainWindow(QMainWindow):
         self._source: FrameSource | None = None
         self._capture_running = False
         self._last_stats_update = 0.0
+        self._solve_thread: QThread | None = None
+        self._solve_worker: SolveWorker | None = None
+        self._result = None
+        self._ocam_result = None
+        self._result_map = None
 
         self.view = LiveView()
+        self.result_view = ResultView()
+        self.result_view.backToScan.connect(self.back_to_scan)
+        self.result_view.finishExport.connect(self.export_calibration)
         self.stats = QLabel("-")
         self.stats.setStyleSheet("font-family: monospace; padding: 6px;")
         self.stats.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -371,7 +447,7 @@ class MainWindow(QMainWindow):
         self.btn_start = QPushButton("Start")
         self.btn_stop = QPushButton("Stop && Kamera freigeben")
         self.btn_stop.setEnabled(False)
-        self.btn_finish = QPushButton("Fertigstellen && Export")
+        self.btn_finish = QPushButton("Ergebnis berechnen")
         self.btn_finish.setEnabled(False)
         self.cmb_model.currentIndexChanged.connect(self._on_model_changed)
         self.cmb_target.currentIndexChanged.connect(self._on_target_changed)
@@ -408,8 +484,11 @@ class MainWindow(QMainWindow):
         sidew.setLayout(side)
         sidew.setFixedWidth(280)
 
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self.view)         # 0: live scan
+        self._stack.addWidget(self.result_view)  # 1: result review
         lay = QHBoxLayout()
-        lay.addWidget(self.view, 1)
+        lay.addWidget(self._stack, 1)
         lay.addWidget(sidew)
         central = QWidget()
         central.setLayout(lay)
@@ -423,6 +502,8 @@ class MainWindow(QMainWindow):
     @Slot()
     def start(self):
         self.stop()
+        self._stack.setCurrentIndex(0)
+        self._result = self._ocam_result = self._result_map = None
         selected_camera = self._selected_camera()
         if self._camera_mode and self.cmb_camera.count() == 0:
             QMessageBox.warning(self, "Keine Kamera",
@@ -693,6 +774,8 @@ class MainWindow(QMainWindow):
     def _default_camera_label(camera: dict, index: int) -> str:
         return camera.get("serial_number") or f"Kamera {index + 1}"
 
+    # ------------------------------------------------------------------
+    # result step: scan -> compute -> review page -> back to scan / export
     @Slot()
     def finish(self):
         if not self._session or len(self._session.views) < 3:
@@ -701,49 +784,100 @@ class MainWindow(QMainWindow):
             return
         self.stop()
 
-        # save dialog: default ~/Documents/<serial>-ocv.xml / -ocam.xml,
-        # result image and OpenCV YAML are written next to it
+        # final solve in a worker thread - the fisheye finish can take a
+        # while and used to freeze the GUI here
+        self.btn_finish.setEnabled(False)
+        self.btn_start.setEnabled(False)
+        self.stats.setText("Ergebnis wird berechnet …\n(kann bei Fisheye"
+                           " einige Minuten dauern)")
+        self._solve_worker = SolveWorker(self._session)
+        self._solve_thread = QThread()
+        self._solve_worker.moveToThread(self._solve_thread)
+        self._solve_thread.started.connect(self._solve_worker.run)
+        self._solve_worker.finished.connect(self._on_solve_done)
+        self._solve_worker.error.connect(self._on_solve_error)
+        self._solve_worker.finished.connect(self._solve_thread.quit)
+        self._solve_worker.error.connect(self._solve_thread.quit)
+        self._solve_thread.start()
+
+    @Slot(object, object, object)
+    def _on_solve_done(self, result, ocam_result, bgr_map):
+        self.btn_finish.setEnabled(True)
+        self.btn_start.setEnabled(True)
+        self._result = result
+        self._ocam_result = ocam_result
+        self._result_map = bgr_map
+        self.result_view.set_result(result, ocam_result, bgr_map)
+        self._stack.setCurrentIndex(1)
+        self.stats.setText(
+            "Ergebnis prüfen:\nGrün = gute Punkte, Rot = schlechte.\n\n"
+            "Back to Scan  -> weiter scannen und verbessern\n"
+            "Finish and Create Calibrationfile -> abschließen")
+
+    @Slot(str)
+    def _on_solve_error(self, msg):
+        self.btn_finish.setEnabled(True)
+        self.btn_start.setEnabled(True)
+        QMessageBox.critical(self, "Kalibrierung fehlgeschlagen", msg)
+
+    @Slot()
+    def back_to_scan(self):
+        """Resume scanning with the existing session - keyframes,
+        coverage and the current model are kept and improved."""
+        self._stack.setCurrentIndex(0)
+        if not self._session:
+            return
+        self._session.resume()
+        selected_camera = self._selected_camera()
+        try:
+            self._source = self._make_source(selected_camera, self._source_options())
+            self._source.open()
+        except Exception as e:
+            QMessageBox.critical(self, "Fehler", str(e))
+            return
+        self._worker = CaptureWorker(self._source, self._session)
+        self._thread = QThread()
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.frameProcessed.connect(self._on_frame)
+        self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._on_capture_finished)
+        self._thread.start()
+        self._capture_running = True
+        self._last_stats_update = 0.0
+        self.btn_stop.setEnabled(True)
+        self.btn_finish.setEnabled(True)
+        self._set_camera_controls_enabled(False)
+        self.cmb_model.setEnabled(False)
+        self.cmb_target.setEnabled(False)
+
+    @Slot()
+    def export_calibration(self):
+        if self._result is None:
+            return
         from pathlib import Path
-        suffix = "ocam" if self._session.cfg.model.value == "fisheye" else "ocv"
+        suffix = "ocam" if self._ocam_result is not None else "ocv"
         default = str(Path.home() / "Documents" / f"{self._camera_id}-{suffix}.xml")
         xml_path, _ = QFileDialog.getSaveFileName(
             self, "Kalibrierung exportieren", default, "XML-Datei (*.xml)")
         if not xml_path:
             return
-
-        # final solve + export in a worker thread - the fisheye finish
-        # can take minutes and used to freeze the GUI here
-        self.btn_finish.setEnabled(False)
-        self.btn_start.setEnabled(False)
-        self.stats.setText("Finale Kalibrierung läuft …\n(kann bei Fisheye"
-                           " einige Minuten dauern)")
-        self._export_worker = ExportWorker(self._session, xml_path,
-                                           self._camera_id, self._pixel_size)
-        self._export_thread = QThread()
-        self._export_worker.moveToThread(self._export_thread)
-        self._export_thread.started.connect(self._export_worker.run)
-        self._export_worker.finished.connect(self._on_export_done)
-        self._export_worker.error.connect(self._on_export_error)
-        self._export_worker.finished.connect(self._export_thread.quit)
-        self._export_worker.error.connect(self._export_thread.quit)
-        self._export_thread.start()
-
-    @Slot(object, dict)
-    def _on_export_done(self, result, written):
-        self.btn_finish.setEnabled(True)
-        self.btn_start.setEnabled(True)
+        try:
+            written = write_calibration_files(
+                self._result, self._ocam_result, xml_path,
+                self._camera_id, self._pixel_size, self._result_map)
+        except Exception as e:
+            QMessageBox.critical(self, "Export fehlgeschlagen", str(e))
+            return
+        r = self._result
+        rms = self._ocam_result.rms if self._ocam_result is not None else r.rms
         QMessageBox.information(
             self, "Export abgeschlossen",
-            f"fx={result.fx:.2f} fy={result.fy:.2f}\n"
-            f"cx={result.cx:.2f} cy={result.cy:.2f}\n"
-            f"RMS={result.rms:.3f} px ({result.n_views} Views)\n\n"
+            f"fx={r.fx:.2f} fy={r.fy:.2f}\n"
+            f"cx={r.cx:.2f} cy={r.cy:.2f}\n"
+            f"RMS={rms:.3f} px ({r.n_views} Views)\n\n"
             + "\n".join(str(p) for p in written.values()))
-
-    @Slot(str)
-    def _on_export_error(self, msg):
-        self.btn_finish.setEnabled(True)
-        self.btn_start.setEnabled(True)
-        QMessageBox.critical(self, "Export fehlgeschlagen", msg)
 
     def closeEvent(self, event):
         self.stop()
