@@ -128,20 +128,40 @@ class OcamCalibrationResult:
     tvecs: list[np.ndarray]
     per_point_errors: list[np.ndarray] = field(default_factory=list)
     used_image_points: list[np.ndarray] = field(default_factory=list)
+    used_reprojections: list[np.ndarray] = field(default_factory=list)
     #: the Kannala-Brandt bootstrap result (for comparison/diagnostics)
     kb: CalibrationResult | None = None
 
 
 def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
-                   refine_affine: bool = True) -> OcamCalibrationResult:
-    """Scaramuzza calibration bootstrapped from the robust KB solve."""
+                   refine_affine: bool = True,
+                   refine_views: list[ViewObservation] | None = None
+                   ) -> OcamCalibrationResult:
+    """Scaramuzza calibration bootstrapped from the robust KB solve.
+
+    ``refine_views`` (aligned 1:1 with ``views``) optionally provides
+    enriched observations for the LM refinement - e.g. recovered rim
+    points. The fragile OpenCV KB bootstrap runs on the conservative
+    ``views``; our own bundle adjustment (warm-started extrinsics, no
+    homography init) digests the extra periphery observations safely.
+    """
     from scipy.optimize import least_squares
     from scipy.sparse import lil_matrix
 
+    if refine_views is not None and len(refine_views) != len(views):
+        raise ValueError("refine_views must align with views")
+
     kb = _calibrate_fisheye(views, image_size)
 
-    # --- initialize the polynomial from the KB r(theta) curve
-    thetas = np.linspace(0.02, _kb_theta_max(kb), 256)
+    # --- initialize the polynomial from the KB r(theta) curve.
+    # The fit must cover the radius range of ALL points fed to the LM
+    # (recovered rim points may exceed the KB observations; a quartic
+    # extrapolates catastrophically beyond its fit range)
+    r_max = 0.0
+    for v in (refine_views or views):
+        r = np.hypot(v.image_points[:, 0] - kb.cx, v.image_points[:, 1] - kb.cy)
+        r_max = max(r_max, float(r.max()))
+    thetas = np.linspace(0.02, _kb_theta_max(kb, r_max * 1.03), 256)
     k = kb.dist_coeffs
     th_d = thetas * (1 + k[0] * thetas**2 + k[1] * thetas**4
                      + k[2] * thetas**6 + k[3] * thetas**8)
@@ -154,12 +174,50 @@ def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
 
     model = OcamModel(image_size=image_size, cx=kb.cx, cy=kb.cy, poly=poly)
 
-    # --- match KB's used views (it may have dropped poisoned ones)
+    # --- match KB's used views back to the input list (it may have
+    #     dropped poisoned views and rejected individual points)
     used_views = []
     for uv in kb.used_image_points:
-        used_views.append(next(
-            v for v in views
-            if len(v.image_points) == len(uv) and np.allclose(v.image_points, uv)))
+        idx = None
+        for i, v in enumerate(views):
+            vi = v.image_points
+            if len(vi) == len(uv) and np.allclose(vi, uv):
+                idx = i
+                break
+            # point-level rejection: uv is a subset of the original view
+            if len(uv) < len(vi):
+                d = np.abs(vi[:, None, :] - uv[None, :, :]).sum(-1).min(axis=0)
+                if float(d.max()) < 1e-3:
+                    idx = i
+                    break
+        if idx is None:
+            raise ValueError("cannot match KB views back to input views")
+        used_views.append(refine_views[idx] if refine_views is not None else views[idx])
+
+    if refine_views is not None:
+        # refine_views are enriched versions of the *raw* views - they may
+        # reintroduce gross outliers that the KB solve's point-level
+        # rejection already removed. Gate every point against the KB
+        # model before the LM sees it.
+        K = kb.camera_matrix
+        D = np.asarray(kb.dist_coeffs[:4], np.float64).reshape(4, 1)
+        thr = max(4.0 * kb.rms, 3.0)
+        gated = []
+        for v, rv, tv in zip(used_views, kb.rvecs, kb.tvecs):
+            proj, _ = cv2.fisheye.projectPoints(
+                v.object_points.reshape(1, -1, 3).astype(np.float64),
+                np.asarray(rv, np.float64), np.asarray(tv, np.float64), K, D)
+            err = np.linalg.norm(proj.reshape(-1, 2) - v.image_points, axis=1)
+            keep = err < thr
+            if keep.sum() < 6:
+                gated.append(v)
+                continue
+            gated.append(ViewObservation(
+                v.image_points[keep], v.object_points[keep],
+                marker_ids=[m for m, k in zip(v.marker_ids, keep) if k]
+                if v.marker_ids else None,
+                timestamp=v.timestamp))
+        used_views = gated
 
     # --- parameter vector: [cx, cy, c, d, e, b0, b2, b3, b4, (rvec,tvec)*n]
     # the polynomial is optimized on the normalized radius rho/r0 so all
@@ -202,17 +260,51 @@ def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
     for i in range(n_views):
         sparsity[offsets[i] * 2:offsets[i + 1] * 2, 9 + 6 * i: 15 + 6 * i] = 1
 
+    # stage 1: robust loss - initial predictions for extreme rim points
+    # can be far off (the bootstrap polynomial is only trustworthy inside
+    # its fit range); soft_l1 keeps them from dominating the solve
     sol = least_squares(residuals, x0, jac_sparsity=sparsity, method="trf",
+                        x_scale="jac", max_nfev=200, ftol=1e-10, xtol=1e-10,
+                        loss="soft_l1", f_scale=2.0, verbose=0)
+
+    # stage 2: drop residual outliers under the converged model, then
+    # polish with a plain least-squares fit
+    m1, _ = unpack(sol.x)
+    res1 = np.linalg.norm(residuals(sol.x).reshape(-1, 2), axis=1)
+    rms1 = float(np.sqrt(np.mean(res1 ** 2)))
+    keep_thr = max(4.0 * rms1, 3.0)
+    cleaned_views = []
+    for i, v in enumerate(used_views):
+        keep = res1[offsets[i]:offsets[i + 1]] < keep_thr
+        if keep.sum() >= 6:
+            cleaned_views.append(ViewObservation(
+                v.image_points[keep], v.object_points[keep],
+                marker_ids=[mid for mid, kf in zip(v.marker_ids, keep) if kf]
+                if v.marker_ids else None, timestamp=v.timestamp))
+        else:
+            cleaned_views.append(v)
+    if sum(len(v) for v in cleaned_views) != int(offsets[-1]):
+        used_views = cleaned_views
+        counts = [len(v) for v in used_views]
+        offsets = np.concatenate([[0], np.cumsum(counts)])
+        n_res = int(offsets[-1]) * 2
+        sparsity = lil_matrix((n_res, len(x0)), dtype=int)
+        sparsity[:, :9] = 1
+        for i in range(n_views):
+            sparsity[offsets[i] * 2:offsets[i + 1] * 2, 9 + 6 * i: 15 + 6 * i] = 1
+    sol = least_squares(residuals, sol.x, jac_sparsity=sparsity, method="trf",
                         x_scale="jac", max_nfev=200, ftol=1e-10, xtol=1e-10,
                         verbose=0)
 
     m, exts = unpack(sol.x)
-    per_view_rms, per_point, rvecs, tvecs = [], [], [], []
+    per_view_rms, per_point, per_reproj, rvecs, tvecs = [], [], [], [], []
     for i, v in enumerate(used_views):
         R, _ = cv2.Rodrigues(exts[i, :3])
         pc = v.object_points.astype(np.float64) @ R.T + exts[i, 3:]
-        err = np.linalg.norm(m.world2cam(pc) - v.image_points, axis=1)
+        proj = m.world2cam(pc)
+        err = np.linalg.norm(proj - v.image_points, axis=1)
         per_point.append(err)
+        per_reproj.append(proj)
         per_view_rms.append(float(np.sqrt(np.mean(err ** 2))))
         rvecs.append(exts[i, :3].reshape(3, 1))
         tvecs.append(exts[i, 3:].reshape(3, 1))
@@ -222,16 +314,18 @@ def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
         model=m, rms=rms, per_view_rms=per_view_rms,
         n_views=n_views, n_points=int(offsets[-1]),
         rvecs=rvecs, tvecs=tvecs, per_point_errors=per_point,
-        used_image_points=[v.image_points for v in used_views], kb=kb)
+        used_image_points=[v.image_points for v in used_views],
+        used_reprojections=per_reproj, kb=kb)
 
 
-def _kb_theta_max(kb: CalibrationResult) -> float:
-    """Largest off-axis angle covered by the KB observations."""
-    w, h = kb.image_size
-    r_max = 0.0
-    for pts in kb.used_image_points:
-        r = np.hypot(pts[:, 0] - kb.cx, pts[:, 1] - kb.cy)
-        r_max = max(r_max, float(r.max()))
+def _kb_theta_max(kb: CalibrationResult, r_max: float | None = None) -> float:
+    """Off-axis angle of the given image radius under the KB model
+    (default: largest radius among the KB observations)."""
+    if r_max is None:
+        r_max = 0.0
+        for pts in kb.used_image_points:
+            r = np.hypot(pts[:, 0] - kb.cx, pts[:, 1] - kb.cy)
+            r_max = max(r_max, float(r.max()))
     k = kb.dist_coeffs
     f_iso = 0.5 * (kb.fx + kb.fy)
     ths = np.linspace(0.01, np.pi * 0.65, 2048)

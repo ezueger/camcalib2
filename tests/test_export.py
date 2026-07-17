@@ -24,15 +24,25 @@ def test_vendor_xml(tmp_path):
     ocv = root.find("camera-ocv")
     f_xy = [float(v) for v in ocv.findtext("f_xy").split()]
     assert f_xy == [1515.0, 1515.5]
-    # legacy convention: +0.5 pixel origin shift
+    # unbiased OpenCV principal point (the legacy software's +0.5 offset
+    # is a quantization artifact of its integer detections, no convention)
     c_xy = [float(v) for v in ocv.findtext("c_xy").split()]
-    assert c_xy == [1501.5, 1062.5]
+    assert c_xy == [1501.0, 1062.0]
     # legacy coefficient order: k1 k2 k3 p1 p2
     d = [float(v) for v in ocv.findtext("dist_coeffs").split()]
     assert d == [-0.042, 0.097, -0.047, 0.0004, -0.0004]
     pin = ocv.find("pinhole-camera")
     assert pin.findtext("resolution") == "3088 2064"
     assert abs(float(pin.findtext("f")) - 1515.0 * 0.0024) < 1e-9
+
+
+def test_vendor_xml_legacy_offset(tmp_path):
+    r = make_result()
+    p = tmp_path / "cam-ocv.xml"
+    write_vendor_xml(r, p, "CAM", legacy_pixel_origin=True)
+    ocv = ET.parse(p).getroot().find("camera-ocv")
+    c_xy = [float(v) for v in ocv.findtext("c_xy").split()]
+    assert c_xy == [1501.5, 1062.5]
 
 
 def test_opencv_yaml(tmp_path):

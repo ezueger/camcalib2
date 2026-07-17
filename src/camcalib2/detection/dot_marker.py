@@ -56,6 +56,47 @@ class DotMarkerDetectorConfig:
     split_dot_factor: float = 1.7
 
 
+def identify_board(gray, boards: list[MarkerBoard] | None = None,
+                   config: "DotMarkerDetectorConfig | None" = None):
+    """Detect which known marker board is visible in the image.
+
+    Boards may share the same id layout (different measured prints) or be
+    id-subsets of each other, so the detection count alone is ambiguous.
+    Candidates with the same (maximum) count are disambiguated by the
+    planar-homography residual of their measured 2D geometry - the
+    per-print measurement differences (up to ~1.7 mm) are well above the
+    detector noise.  Returns ``(board, n_detected)`` or ``(None, 0)``.
+    """
+    if boards is None:
+        boards = [MarkerBoard.builtin(n) for n in MarkerBoard.builtin_names()]
+    detections = []
+    best_n = 0
+    for board in boards:
+        markers = DotMarkerDetector(board, config).detect(gray)
+        detections.append(markers)
+        best_n = max(best_n, len(markers))
+    if best_n < 12:
+        best = max(zip(boards, detections), key=lambda bd: len(bd[1]), default=(None, []))
+        return (best[0], len(best[1])) if best[1] else (None, 0)
+
+    candidates = [(b, d) for b, d in zip(boards, detections) if len(d) == best_n]
+    if len(candidates) == 1:
+        return candidates[0][0], best_n
+
+    best, best_res = None, np.inf
+    for board, markers in candidates:
+        obj = board.object_points([m.marker_id for m in markers])[:, :2]
+        img = np.array([m.center for m in markers], np.float64)
+        H, _ = cv2.findHomography(obj, img, cv2.RANSAC, 5.0)
+        if H is None:
+            continue
+        proj = cv2.perspectiveTransform(obj.reshape(-1, 1, 2), H).reshape(-1, 2)
+        res = float(np.median(np.linalg.norm(proj - img, axis=1)))
+        if res < best_res:
+            best, best_res = board, res
+    return (best, best_n) if best is not None else (None, 0)
+
+
 class DotMarkerDetector:
     def __init__(self, board: MarkerBoard, config: DotMarkerDetectorConfig | None = None):
         self.board = board

@@ -109,6 +109,13 @@ class CalibrationSession:
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         ids, pts, obj = self._detect(gray)
 
+        # model-guided recovery: once a preliminary calibration exists,
+        # re-measure observations the detector missed (lens periphery!)
+        with self._lock:
+            model_result = self._result
+        if model_result is not None and len(ids) >= 8:
+            ids, pts, obj = self._recover(gray, ids, pts, obj, model_result)
+
         keyframe = False
         reason = "no_target"
         if len(ids) > 0 and self.state in (SessionState.WAITING, SessionState.SCANNING):
@@ -133,6 +140,31 @@ class CalibrationSession:
             tilt_coverage=self.coverage.tilt_fraction,
             n_keyframes=len(self.views), rms=rms, result=result,
             progress=progress)
+
+    # ------------------------------------------------------------------
+    def _recover(self, gray, ids, pts, obj, model_result):
+        from ..calibration.solver import ViewObservation
+        from ..detection.recovery import (make_projector, recover_dot_markers,
+                                          recover_checkerboard_corners)
+        try:
+            view = ViewObservation(pts, obj, marker_ids=list(ids))
+            # tighter angle cap for fisheye: these points feed the
+            # incremental KB solver, whose init is fragile at the rim
+            theta_cap = 85.0 if self.cfg.model is CameraModel.FISHEYE else 100.0
+            projector = make_projector(model_result, view, theta_max_deg=theta_cap)
+            if projector is None:
+                return ids, pts, obj
+            if isinstance(self.target, MarkerBoard):
+                view2, n = recover_dot_markers(gray, self.target, view, projector)
+            else:
+                view2, n = recover_checkerboard_corners(
+                    gray, view, projector, self.target.square_size)
+            if n > 0:
+                return (list(view2.marker_ids), view2.image_points,
+                        view2.object_points)
+        except (cv2.error, ValueError):
+            pass
+        return ids, pts, obj
 
     # ------------------------------------------------------------------
     def _accept_keyframe(self, ids, pts, obj, timestamp):

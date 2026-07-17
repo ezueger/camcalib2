@@ -1,5 +1,6 @@
 from .checkerboard import CheckerboardDetection, CheckerboardDetector
-from .dot_marker import DetectedMarker, DotMarkerDetector, DotMarkerDetectorConfig
+from .dot_marker import (DetectedMarker, DotMarkerDetector,
+                         DotMarkerDetectorConfig, identify_board)
 
 __all__ = [
     "CheckerboardDetection",
@@ -7,4 +8,5 @@ __all__ = [
     "DetectedMarker",
     "DotMarkerDetector",
     "DotMarkerDetectorConfig",
+    "identify_board",
 ]

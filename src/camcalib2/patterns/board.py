@@ -46,6 +46,24 @@ class MarkerBoard:
         ref = resources.files("camcalib2.patterns") / "resources" / f"{name}.json"
         return cls.from_json(json.loads(ref.read_text()))
 
+    @staticmethod
+    def builtin_names() -> list[str]:
+        res = resources.files("camcalib2.patterns") / "resources"
+        return sorted(p.name[:-5] for p in res.iterdir() if p.name.endswith(".json"))
+
+    @classmethod
+    def from_txt(cls, path, name: str | None = None) -> "MarkerBoard":
+        """Load a board from the original software's pattern definition
+        (whitespace separated lines: ``id x_mm y_mm z_mm``)."""
+        markers = {}
+        for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+            tok = line.split()
+            if len(tok) >= 4 and tok[0].lstrip("+-").isdigit():
+                markers[int(tok[0])] = (float(tok[1]), float(tok[2]), float(tok[3]))
+        if not markers:
+            raise ValueError(f"no markers found in {path}")
+        return cls(name=name or Path(path).stem, markers=markers)
+
     @classmethod
     def from_config_xml(cls, path, name: str | None = None) -> "MarkerBoard":
         """Load marker definitions from a legacy calibration project config.xml."""

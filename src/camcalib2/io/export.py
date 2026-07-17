@@ -1,14 +1,18 @@
 """Result export: legacy vendor XML, OpenCV YAML, coverage image.
 
-Conventions of the legacy format (determined from reference data):
+Conventions of the legacy format (verified against the original source
+code, Exporter.cpp / Evaluation.cpp):
 
 * ``dist_coeffs`` order is ``k1 k2 k3 p1 p2`` (NOT OpenCV's k1 k2 p1 p2 k3),
-* pixel coordinates use a corner-origin convention, i.e. legacy values =
-  OpenCV values + 0.5 (verified against reference detections, constant
-  offset (+0.5, +0.5) with ~0.12 px spread),
+* the legacy pipeline stores marker detections as *truncated integers*
+  (the IFF detector's sub-pixel result is cast to cv::Point2i), so its
+  outputs carry a ~0.5 px quantization artifact; there is NO deliberate
+  coordinate-convention shift in its export.  ``legacy_pixel_origin``
+  (off by default) can add +0.5 for experiments,
 * ``<f>`` is the focal length in mm (fx * pixel size),
-* ``<rad>`` is the radius of the calibrated/covered region relative to
-  the half diagonal of the sensor.
+* ``<rad>`` is the confidence radius: the distance of the outermost
+  observation with reprojection error < 5 px from the principal point,
+  relative to the half diagonal of the sensor.
 """
 
 from __future__ import annotations
@@ -27,13 +31,22 @@ def _fmt(v: float) -> str:
     return f"{v:.6g}"
 
 
-def coverage_radius(result: CalibrationResult, points: np.ndarray | None) -> float:
-    """Max observed radius around the principal point / half diagonal."""
+def coverage_radius(result: CalibrationResult, points: np.ndarray | None,
+                    errors: np.ndarray | None = None,
+                    max_error: float = 5.0) -> float:
+    """Confidence radius as defined by the legacy software
+    (Evaluation::estimateConfidenceRadius): the largest distance from the
+    principal point over all observations with reprojection error below
+    ``max_error``, normalized by the half diagonal."""
     w, h = result.image_size
     half_diag = float(np.hypot(w / 2.0, h / 2.0))
     if points is None or len(points) == 0:
         return 1.0
     r = np.hypot(points[:, 0] - result.cx, points[:, 1] - result.cy)
+    if errors is not None and len(errors) == len(r):
+        r = r[np.asarray(errors) < max_error]
+        if r.size == 0:
+            return 1.0
     return float(min(1.0, r.max() / half_diag))
 
 
@@ -41,7 +54,8 @@ def write_vendor_xml(result: CalibrationResult, path, camera_id: str,
                      pixel_size_mm: tuple[float, float] | None = None,
                      description: str | None = None,
                      points: np.ndarray | None = None,
-                     legacy_pixel_origin: bool = True) -> None:
+                     errors: np.ndarray | None = None,
+                     legacy_pixel_origin: bool = False) -> None:
     """Write the legacy ``camera-calibration`` XML format."""
     if result.model is not CameraModel.PINHOLE:
         raise ValueError("vendor XML export is defined for the pinhole model")
@@ -68,7 +82,7 @@ def write_vendor_xml(result: CalibrationResult, path, camera_id: str,
     ET.SubElement(ocv, "dist_coeffs").text = " ".join(
         _fmt(v) for v in (k1, k2, k3, p1, p2))
     ET.SubElement(ocv, "residual_error").text = _fmt(result.rms)
-    ET.SubElement(ocv, "rad").text = _fmt(coverage_radius(result, points))
+    ET.SubElement(ocv, "rad").text = _fmt(coverage_radius(result, points, errors))
 
     ET.indent(root)
     tree = ET.ElementTree(root)
@@ -100,7 +114,11 @@ def write_ocam_xml(ocam_result, path, camera_id: str,
     half_diag = float(np.hypot(w / 2.0, h / 2.0))
     if points is not None and len(points):
         r = np.hypot(points[:, 0] - m.cx, points[:, 1] - m.cy)
-        rad = float(min(1.0, r.max() / half_diag))
+        errs = np.concatenate(ocam_result.per_point_errors) \
+            if ocam_result.per_point_errors else None
+        if errs is not None and len(errs) == len(r):
+            r = r[errs < 5.0]
+        rad = float(min(1.0, r.max() / half_diag)) if r.size else 1.0
     else:
         rad = 1.0
     ET.SubElement(root, "rad").text = _fmt(rad)
@@ -132,36 +150,52 @@ def write_opencv_yaml(result: CalibrationResult, path) -> None:
 
 def render_result_image(result: CalibrationResult,
                         views_points: list[np.ndarray],
-                        views_errors: list[np.ndarray]) -> np.ndarray:
-    """Coverage/error map in the style of the legacy ``result.jpg``:
-    every observation drawn as a small circle colored by reprojection
-    error (green <=1px, yellow <=2px, orange <=3px, red >3px) plus the
-    calibrated-region boundary in blue."""
+                        views_errors: list[np.ndarray],
+                        views_reproj: list[np.ndarray] | None = None) -> np.ndarray:
+    """Coverage/error map in the style of the legacy ``result.jpg``
+    (Evaluation::drawErrorvectors): every observation drawn as an error
+    vector (detected -> reprojected) with a circle at the tip, colored by
+    reprojection error (green <=1px, yellow <=2px, orange <=3px,
+    red >3px); views with errors > 2px are annotated with their view
+    index; blue circle = confidence radius around the principal point."""
     w, h = result.image_size
     img = np.zeros((h, w, 3), np.uint8)
 
-    colors = [(0, 200, 0), (0, 220, 220), (0, 140, 255), (0, 0, 255)]
-    all_pts = []
-    for pts, errs in zip(views_points, views_errors):
+    colors = [(0, 200, 0), (0, 200, 200), (0, 100, 200), (0, 0, 255)]
+    radius = max(2, h // 400)
+    thick = max(1, h // 1620)
+    font = max(0.7, h / 1000.0 * 0.7)
+    all_pts, all_errs = [], []
+    for vi, (pts, errs) in enumerate(zip(views_points, views_errors)):
+        reproj = views_reproj[vi] if views_reproj else None
         all_pts.append(pts)
-        for (x, y), e in zip(pts, errs):
+        all_errs.append(errs)
+        for i, ((x, y), e) in enumerate(zip(pts, errs)):
             c = colors[0] if e <= 1 else colors[1] if e <= 2 else colors[2] if e <= 3 else colors[3]
-            cv2.circle(img, (int(round(x)), int(round(y))), 4, c, 1, cv2.LINE_AA)
+            p0 = (int(round(x)), int(round(y)))
+            if reproj is not None:
+                p1 = (int(round(reproj[i][0])), int(round(reproj[i][1])))
+                cv2.line(img, p0, p1, c, thick + 1, cv2.LINE_AA)
+                cv2.circle(img, p1, radius, c, thick, cv2.LINE_AA)
+            else:
+                cv2.circle(img, p0, radius, c, thick, cv2.LINE_AA)
+            if e > 2.0:
+                cv2.putText(img, str(vi), (p0[0] + 6, p0[1] - 4),
+                            cv2.FONT_HERSHEY_PLAIN, font, (255, 255, 255), 1, cv2.LINE_AA)
     pts = np.vstack(all_pts) if all_pts else None
+    errs = np.concatenate(all_errs) if all_errs else None
 
-    rad = coverage_radius(result, pts)
+    rad = coverage_radius(result, pts, errs)
     half_diag = float(np.hypot(w / 2.0, h / 2.0))
     cv2.circle(img, (int(round(result.cx)), int(round(result.cy))),
-               int(round(rad * half_diag)), (255, 80, 0), 2, cv2.LINE_AA)
+               int(round(rad * half_diag)), (255, 0, 0), 2, cv2.LINE_AA)
 
-    scale = max(1.0, h / 1000.0)
-    legend = [("err<=1px", colors[0]), ("<=2px", colors[1]),
-              ("<=3px", colors[2]), (">3px", colors[3])]
-    x = int(10 * scale)
+    legend = [("err:", (255, 255, 255)), ("<=1px;", colors[0]), ("<=2px;", colors[1]),
+              ("<=3px;", colors[2]), (">3px", colors[3])]
+    x = 10
     for text, c in legend:
-        cv2.putText(img, text, (x, h - int(12 * scale)), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5 * scale, c, 1, cv2.LINE_AA)
-        x += int((90 + 18 * len(text) / 8) * scale)
+        cv2.putText(img, text, (x, h - 10), cv2.FONT_HERSHEY_PLAIN, font, c, 1, cv2.LINE_AA)
+        x += 40 + int(len(text) * 11 * font)
     return img
 
 
@@ -169,16 +203,20 @@ def export_all(result: CalibrationResult, out_dir, camera_id: str,
                views_points: list[np.ndarray], views_errors: list[np.ndarray],
                pixel_size_mm: tuple[float, float] | None = None,
                description: str | None = None,
-               ocam_result=None) -> dict[str, Path]:
+               ocam_result=None,
+               views_reproj: list[np.ndarray] | None = None) -> dict[str, Path]:
     """Write vendor XML (pinhole) / ocam XML (fisheye), OpenCV YAML and
     the result image."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     written = {}
     pts = np.vstack(views_points) if views_points else None
+    errs = np.concatenate(views_errors) if views_errors else None
+    if views_reproj is None and result.used_reprojections:
+        views_reproj = result.used_reprojections
     if result.model is CameraModel.PINHOLE:
         p = out / f"{camera_id}-ocv.xml"
-        write_vendor_xml(result, p, camera_id, pixel_size_mm, description, pts)
+        write_vendor_xml(result, p, camera_id, pixel_size_mm, description, pts, errs)
         written["vendor_xml"] = p
     if ocam_result is not None:
         p = out / f"{camera_id}-ocam.xml"
@@ -187,7 +225,7 @@ def export_all(result: CalibrationResult, out_dir, camera_id: str,
     p = out / f"{camera_id}-opencv.yaml"
     write_opencv_yaml(result, p)
     written["opencv_yaml"] = p
-    img = render_result_image(result, views_points, views_errors)
+    img = render_result_image(result, views_points, views_errors, views_reproj)
     p = out / "result.jpg"
     cv2.imwrite(str(p), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
     written["result_image"] = p
