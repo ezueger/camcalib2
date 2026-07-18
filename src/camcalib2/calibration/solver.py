@@ -217,20 +217,35 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
         raise RuntimeError("fisheye calibration failed: not enough usable views")
     ranked.sort(key=lambda x: x[0])
 
-    # 3) grow the view set incrementally; a view whose (fragile,
+    # scalability cap: the incremental grow below re-solves after every
+    # addition; beyond ~40 views the cost explodes (this looked like a
+    # silent hang in the UI) while extra views add little - keep the
+    # best-fitting ones
+    MAX_KB_VIEWS = 40
+    if len(ranked) > MAX_KB_VIEWS:
+        ranked = ranked[:MAX_KB_VIEWS]
+
+    # 3) grow the view set in chunks; a view whose (fragile,
     #    homography-based) extrinsics initialization breaks the joint
-    #    solve is identified by the failing addition and skipped
+    #    solve is identified by bisecting the failing chunk
     usable = [ranked[0][1], ranked[1][1], ranked[2][1]]
     result = _fisheye_joint(usable, image_size, K0, D0)
     K, D = result[1], result[2]
-    for _, v in ranked[3:]:
+    rest = [v for _, v in ranked[3:]]
+    stack = [rest[i:i + 5] for i in range(0, len(rest), 5)][::-1]
+    while stack:
+        chunk = stack.pop()
         try:
-            cand = _fisheye_joint(usable + [v], image_size, K, D)
+            cand = _fisheye_joint(usable + chunk, image_size, K, D)
+            usable += chunk
+            result = cand
+            K, D = result[1], result[2]
         except cv2.error:
-            continue
-        usable.append(v)
-        result = cand
-        K, D = result[1], result[2]
+            if len(chunk) == 1:
+                continue  # single poisoned view - skip it
+            mid = len(chunk) // 2
+            stack.append(chunk[mid:])
+            stack.append(chunk[:mid])
     rms, K, D, rvecs, tvecs, per_view, per_point, per_reproj = result
 
     # 3) iteratively drop poisoned views (stuck extrinsics show up with

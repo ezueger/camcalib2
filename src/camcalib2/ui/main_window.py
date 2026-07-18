@@ -107,6 +107,8 @@ class CaptureWorker(QObject):
     frameProcessed = Signal(np.ndarray, object, object)  # gray frame, FrameFeedback, RuntimeMetrics
     finished = Signal()
     error = Signal(str)
+    #: every frame at camera fps: frame, StillTick, RuntimeMetrics
+    framePreview = Signal(np.ndarray, object, object)
 
     def __init__(self, source: FrameSource, session: CalibrationSession):
         super().__init__()
@@ -126,25 +128,59 @@ class CaptureWorker(QObject):
 
     @Slot()
     def run(self):
+        """Still-capture loop: every frame is displayed at camera fps
+        with only a cheap motion tick; the expensive CV evaluation runs
+        in a side thread exactly once per hold-still phase."""
         self._running = True
         self._reset_metrics()
+        self._eval_thread: threading.Thread | None = None
+        self._eval_result: tuple | None = None
         try:
+            monotonic0 = time.perf_counter()
             while self._running:
                 ok, frame, ts = self.source.read()
                 if not ok:
                     break
+                if ts is None or ts <= 0:
+                    ts = time.perf_counter() - monotonic0
                 process_started = time.perf_counter()
-                fb = self.session.process(frame, ts)
+
+                # deliver a completed evaluation (coverage/points update)
+                if self._eval_result is not None:
+                    eframe, efb = self._eval_result
+                    self._eval_result = None
+                    metrics = self._record_processed_frame(
+                        time.perf_counter() - process_started)
+                    self._begin_preview_delivery()  # released by _on_frame
+                    self.frameProcessed.emit(eframe, efb, metrics)
+
+                tick = self.session.tick(frame, ts)
+                if (tick.evaluate and
+                        (self._eval_thread is None or not self._eval_thread.is_alive())):
+                    def _evaluate(f=frame, t=ts):
+                        try:
+                            fb = self.session.evaluate(f, t)
+                            self._eval_result = (f, fb)
+                        except Exception as e:
+                            self._eval_result = None
+                            if self._running:
+                                self.error.emit(str(e))
+                    self._eval_thread = threading.Thread(target=_evaluate, daemon=True)
+                    self._eval_thread.start()
+
                 process_s = time.perf_counter() - process_started
                 metrics = self._record_processed_frame(process_s)
                 if self._begin_preview_delivery():
-                    self.frameProcessed.emit(frame, fb, metrics)
+                    self.framePreview.emit(frame, tick, metrics)
                 else:
                     self._record_dropped_preview()
         except Exception as e:  # surface errors instead of dying silently
             if self._running:
                 self.error.emit(str(e))
         finally:
+            t = getattr(self, "_eval_thread", None)
+            if t is not None and t.is_alive():
+                t.join(timeout=5.0)
             self.finished.emit()
 
     def stop(self):
@@ -228,6 +264,7 @@ class LiveView(QLabel):
         self.setStyleSheet("background-color: #101014;")
         self._frame: np.ndarray | None = None
         self._fb: FrameFeedback | None = None
+        self._tick = None  # StillTick of the latest preview frame
         self._coverage_mask: np.ndarray | None = None
 
     def update_frame(self, frame: np.ndarray, fb: FrameFeedback, coverage_mask):
@@ -235,6 +272,23 @@ class LiveView(QLabel):
         self._fb = fb
         self._coverage_mask = coverage_mask
         self.update()
+
+    def update_preview(self, frame: np.ndarray, tick, coverage_mask):
+        """Every camera frame: fresh image + capture-state overlay; the
+        last evaluation's points/coverage stay visible."""
+        self._frame = frame
+        self._tick = tick
+        if coverage_mask is not None:
+            self._coverage_mask = coverage_mask
+        self.update()
+
+    _STATE_COLORS = {
+        "move": QColor(255, 170, 40),      # orange: bewegen
+        "hold": QColor(250, 220, 60),      # gelb: still halten
+        "evaluating": QColor(90, 170, 255),  # blau: rechnet
+        "captured": QColor(80, 230, 120),  # grün: aufgenommen
+        "full": QColor(80, 230, 120),
+    }
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -251,6 +305,25 @@ class LiveView(QLabel):
         ox, oy = (self.width() - dw) // 2, (self.height() - dh) // 2
         painter.drawImage(ox, oy, img.scaled(dw, dh, Qt.KeepAspectRatio,
                                              Qt.SmoothTransformation))
+
+        # --- still-capture state: colored frame border + message
+        tick = self._tick
+        if tick is not None:
+            state = getattr(tick.capture_state, "value", str(tick.capture_state))
+            color = self._STATE_COLORS.get(state, QColor(200, 200, 200))
+            painter.setPen(QPen(color, 6))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(ox + 3, oy + 3, dw - 6, dh - 6)
+            if state == "hold" and tick.hold_progress > 0:
+                # settle progress arc top-center
+                r = int(min(dw, dh) * 0.06)
+                painter.setPen(QPen(color, 5, Qt.SolidLine, Qt.RoundCap))
+                painter.drawArc(ox + dw // 2 - r, oy + 16, 2 * r, 2 * r,
+                                90 * 16, int(-360 * 16 * tick.hold_progress))
+            painter.setFont(QFont("Sans", 13, QFont.Bold))
+            painter.setPen(color)
+            painter.drawText(ox + 14, oy + 30, tick.message)
+
         fb = self._fb
         if fb is None:
             painter.end()
@@ -410,6 +483,7 @@ class MainWindow(QMainWindow):
         self._source: FrameSource | None = None
         self._capture_running = False
         self._last_stats_update = 0.0
+        self._last_fb = None
         self._solve_thread: QThread | None = None
         self._solve_worker: SolveWorker | None = None
         self._result = None
@@ -504,6 +578,7 @@ class MainWindow(QMainWindow):
         self.stop()
         self._stack.setCurrentIndex(0)
         self._result = self._ocam_result = self._result_map = None
+        self._last_fb = None
         selected_camera = self._selected_camera()
         if self._camera_mode and self.cmb_camera.count() == 0:
             QMessageBox.warning(self, "Keine Kamera",
@@ -526,6 +601,7 @@ class MainWindow(QMainWindow):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.frameProcessed.connect(self._on_frame)
+        self._worker.framePreview.connect(self._on_preview)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._on_capture_finished)
@@ -573,27 +649,32 @@ class MainWindow(QMainWindow):
 
     @Slot(np.ndarray, object, object)
     def _on_frame(self, frame, fb: FrameFeedback, metrics: RuntimeMetrics):
+        """A completed evaluation (still-capture) - update coverage/points."""
         try:
             mask = self._session.coverage.mask() if self._session else None
             self.view.update_frame(frame, fb, mask)
-            now = time.perf_counter()
-            if now - self._last_stats_update >= 0.25:
-                lines = [
-                    f"Status {fb.state.value} | Marker {len(fb.ids)} | KF {fb.n_keyframes}",
-                    f"Abd {fb.coverage*100:.0f}% | Winkel {fb.tilt_coverage*100:.0f}%",
-                    f"Laufz {metrics.elapsed_s:6.1f}s | Cap {metrics.capture_fps:4.1f} fps | UI {metrics.display_fps:4.1f} fps",
-                    f"Frames {metrics.captured_frames}/{metrics.displayed_frames} | Drops {metrics.dropped_previews}",
-                    f"Proc {metrics.last_process_ms:6.1f} ms | Avg {metrics.avg_process_ms:5.1f} | Peak {metrics.max_process_ms:6.1f}",
-                ]
-                if fb.result is not None:
-                    r = fb.result
-                    lines += [
-                        "",
-                        f"fx {r.fx:8.2f} | fy {r.fy:8.2f} | RMS {r.rms:6.3f} px",
-                        f"cx {r.cx:8.2f} | cy {r.cy:8.2f} | Views {r.n_views}",
-                    ]
-                self.stats.setText("\n".join(lines))
-                self._last_stats_update = now
+            self._last_fb = fb
+            self._update_stats(fb, metrics)
+        finally:
+            # release directly from the UI thread (see _on_preview)
+            worker = self._worker
+            if worker is not None:
+                worker.on_frame_displayed()
+
+    @Slot(np.ndarray, object, object)
+    def _on_preview(self, frame, tick, metrics: RuntimeMetrics):
+        """Every camera frame at native fps - cheap overlay only."""
+        try:
+            mask = self._session.coverage.mask() if self._session else None
+            self.view.update_preview(frame, tick, mask)
+            fb = getattr(self, "_last_fb", None)
+            if fb is not None:
+                self._update_stats(fb, metrics, tick)
+            elif time.perf_counter() - self._last_stats_update >= 0.25:
+                self.stats.setText(
+                    f"Cap {metrics.capture_fps:4.1f} fps | UI {metrics.display_fps:4.1f} fps\n"
+                    f"{tick.message}")
+                self._last_stats_update = time.perf_counter()
         finally:
             # Call directly from the UI thread: queued delivery back into the
             # worker thread would stall because the capture loop keeps that
@@ -601,6 +682,28 @@ class MainWindow(QMainWindow):
             worker = self._worker
             if worker is not None:
                 worker.on_frame_displayed()
+
+    def _update_stats(self, fb: FrameFeedback, metrics: RuntimeMetrics, tick=None):
+        now = time.perf_counter()
+        if now - self._last_stats_update < 0.25:
+            return
+        lines = [
+            f"Status {fb.state.value} | Marker {len(fb.ids)} | KF {fb.n_keyframes}",
+            f"Abd {fb.coverage*100:.0f}% | Winkel {fb.tilt_coverage*100:.0f}%",
+            f"Laufz {metrics.elapsed_s:6.1f}s | Cap {metrics.capture_fps:4.1f} fps | UI {metrics.display_fps:4.1f} fps",
+            f"Frames {metrics.captured_frames}/{metrics.displayed_frames} | Drops {metrics.dropped_previews}",
+        ]
+        if tick is not None:
+            lines.append(f"Motion {tick.motion:5.2f} | {tick.message}")
+        if fb.result is not None:
+            r = fb.result
+            lines += [
+                "",
+                f"fx {r.fx:8.2f} | fy {r.fy:8.2f} | RMS {r.rms:6.3f} px",
+                f"cx {r.cx:8.2f} | cy {r.cy:8.2f} | Views {r.n_views}",
+            ]
+        self.stats.setText("\n".join(lines))
+        self._last_stats_update = now
 
     @Slot(str)
     def _on_error(self, msg):
@@ -840,6 +943,7 @@ class MainWindow(QMainWindow):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.frameProcessed.connect(self._on_frame)
+        self._worker.framePreview.connect(self._on_preview)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._on_capture_finished)
