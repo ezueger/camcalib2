@@ -209,7 +209,13 @@ class GenICamSource(FrameSource):
 
         self._harvester = Harvester()
         for cti in ctis:
-            self._harvester.add_file(cti)
+            try:
+                self._harvester.add_file(cti)
+            except Exception:
+                # A broken/conflicting producer (e.g. from an unrelated
+                # vendor SDK installed on the same machine) must not stop
+                # discovery through the other producers.
+                continue
         self._harvester.update()
         if not self._harvester.device_info_list:
             raise RuntimeError("no GenICam camera found")
@@ -478,6 +484,11 @@ class GenICamSource(FrameSource):
                         out,
                         [GenICamSource._camera_from_device_info(device_info, cti)],
                     )
+            except Exception:
+                # A broken/conflicting producer (e.g. from an unrelated
+                # vendor SDK installed on the same machine) must not stop
+                # discovery through the other producers.
+                continue
             finally:
                 h.reset()
         return out
