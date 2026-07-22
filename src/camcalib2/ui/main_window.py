@@ -6,9 +6,9 @@ import threading
 import time
 from dataclasses import dataclass
 import numpy as np
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPen,
-                           QPixmap)
+from PySide6.QtCore import QObject, QPoint, QRect, QRectF, Qt, QThread, Signal, Slot
+from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter,
+                           QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QHBoxLayout, QLabel, QMainWindow,
                                QMessageBox, QPushButton, QStackedWidget,
@@ -16,40 +16,71 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
 
 from ..calibration import CameraModel
 from ..capture.source import FrameSource
-from ..session import CalibrationSession, FrameFeedback, SessionConfig, SessionState
+from ..session import (CalibrationSession, FrameFeedback, Roi, SessionConfig,
+                       SessionState, cells_in_roi)
 
 
 class SolveWorker(QObject):
     """Runs the final solve off the GUI thread (a fisheye finish can
     take minutes - running it inline froze the window). Computes the
-    calibration + the traffic-light coverage map; writes no files."""
+    calibration + the traffic-light coverage map; writes no files.
+
+    Reports phase-weighted progress (0..100 %) via ``progress`` and can be
+    aborted via ``cancel()`` (a threading.Event checked inside the solve)."""
 
     finished = Signal(object, object, object)  # result, ocam_result|None, map(np.ndarray BGR)
     error = Signal(str)
+    progress = Signal(float, str)  # percent 0..100, phase message
+    cancelled = Signal()
 
     def __init__(self, session: CalibrationSession):
         super().__init__()
         self.session = session
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def _band(self, lo, hi):
+        """A progress_cb mapping a phase's local 0..1 into a global slice."""
+        def cb(frac, msg):
+            frac = max(0.0, min(1.0, frac))
+            self.progress.emit((lo + (hi - lo) * frac) * 100.0, msg)
+        return cb
 
     @Slot()
     def run(self):
+        from ..calibration.solver import SolveCancelled
         try:
             from ..io.export import render_result_image
 
-            result = self.session.finish()
+            fisheye = self.session.cfg.model is CameraModel.FISHEYE
+            # top-level split: KB solve | OCam refine | result render
+            kb_hi = 0.30 if fisheye else 0.90
+            result = self.session.finish(
+                progress_cb=self._band(0.0, kb_hi),
+                cancel_event=self.cancel_event)
             ocam = None
             views_points = result.used_image_points
             views_errors = result.per_point_errors
             views_reproj = result.used_reprojections
-            if result.model.value == "fisheye":
+            if fisheye:
                 from ..calibration.ocam import calibrate_ocam
-                ocam = calibrate_ocam(self.session.views, self.session.image_size)
+                # reuse the KB solve just computed (same views/image_size)
+                ocam = calibrate_ocam(
+                    self.session.views, self.session.image_size, kb=result,
+                    progress_cb=self._band(kb_hi, 0.95),
+                    cancel_event=self.cancel_event)
                 views_points = ocam.used_image_points
                 views_errors = ocam.per_point_errors
                 views_reproj = ocam.used_reprojections
+            self.progress.emit(96.0, "Ergebnisbild …")
             img = render_result_image(result, views_points, views_errors,
                                       views_reproj)
+            self.progress.emit(100.0, "Fertig")
             self.finished.emit(result, ocam, img)
+        except SolveCancelled:
+            self.cancelled.emit()
         except Exception as e:
             self.error.emit(str(e))
 
@@ -257,6 +288,11 @@ class CaptureWorker(QObject):
 class LiveView(QLabel):
     """Video widget with coverage veil, marker dots and progress ring."""
 
+    #: emitted while the user drags the ROI (payload: the new Roi)
+    roiChanged = Signal(object)
+
+    _HANDLE = 10  # resize-handle hit/draw size in widget pixels
+
     def __init__(self):
         super().__init__()
         self.setMinimumSize(640, 480)
@@ -266,6 +302,18 @@ class LiveView(QLabel):
         self._fb: FrameFeedback | None = None
         self._tick = None  # StillTick of the latest preview frame
         self._coverage_mask: np.ndarray | None = None
+        # region of interest editing
+        self._roi: Roi | None = None
+        self._roi_edit = False
+        self._roi_square = False
+        self._drag_mode: str | None = None
+        self._drag_start_img: tuple[float, float] | None = None
+        self._drag_start_roi: Roi | None = None
+        self._hover_mode: str | None = None
+        # solve progress overlay
+        self._computing = False
+        self._compute_progress = 0.0
+        self._compute_text = ""
 
     def update_frame(self, frame: np.ndarray, fb: FrameFeedback, coverage_mask):
         self._frame = frame
@@ -281,6 +329,157 @@ class LiveView(QLabel):
         if coverage_mask is not None:
             self._coverage_mask = coverage_mask
         self.update()
+
+    def set_computing(self, active: bool, progress: float = 0.0, text: str = ""):
+        """Show/update the solve-progress overlay on the frozen frame."""
+        self._computing = active
+        self._compute_progress = progress
+        self._compute_text = text
+        self.update()
+
+    # --- ROI editing --------------------------------------------------
+    def set_roi(self, roi, square: bool = False):
+        self._roi = roi
+        self._roi_square = square
+        self.update()
+
+    def set_roi_edit(self, on: bool):
+        self._roi_edit = bool(on)
+        self.setMouseTracking(self._roi_edit)
+        if not self._roi_edit:
+            self._drag_mode = None
+            self._hover_mode = None
+            self.unsetCursor()
+        self.update()
+
+    def _image_size(self):
+        h, w = self._frame.shape[:2]
+        return (w, h)
+
+    def _image_transform(self):
+        """(scale, ox, oy, dw, dh): full-sensor pixels <-> widget pixels."""
+        h, w = self._frame.shape[:2]
+        scale = min(self.width() / w, self.height() / h)
+        dw, dh = int(w * scale), int(h * scale)
+        ox, oy = (self.width() - dw) // 2, (self.height() - dh) // 2
+        return scale, ox, oy, dw, dh
+
+    def _image_to_widget(self, x, y):
+        scale, ox, oy, _, _ = self._image_transform()
+        return ox + x * scale, oy + y * scale
+
+    def _widget_to_image(self, wx, wy):
+        scale, ox, oy, _, _ = self._image_transform()
+        return (wx - ox) / scale, (wy - oy) / scale
+
+    def _roi_handles(self):
+        """name -> (image_x, image_y) for the active resize handles."""
+        r = self._roi
+        cx, cy = r.x + r.w / 2, r.y + r.h / 2
+        pts = {"nw": (r.x, r.y), "ne": (r.x1, r.y),
+               "sw": (r.x, r.y1), "se": (r.x1, r.y1)}
+        if not self._roi_square:  # free rectangle also gets edge midpoints
+            pts.update({"n": (cx, r.y), "s": (cx, r.y1),
+                        "w": (r.x, cy), "e": (r.x1, cy)})
+        return pts
+
+    _CURSORS = {
+        "nw": Qt.SizeFDiagCursor, "se": Qt.SizeFDiagCursor,
+        "ne": Qt.SizeBDiagCursor, "sw": Qt.SizeBDiagCursor,
+        "n": Qt.SizeVerCursor, "s": Qt.SizeVerCursor,
+        "w": Qt.SizeHorCursor, "e": Qt.SizeHorCursor,
+        "move": Qt.SizeAllCursor,
+    }
+
+    def _hit_test(self, pos):
+        """Return handle name / 'move' / None for a widget-space point."""
+        if self._roi is None or self._frame is None:
+            return None
+        wx, wy = pos.x(), pos.y()
+        for name, (ix, iy) in self._roi_handles().items():
+            hx, hy = self._image_to_widget(ix, iy)
+            if abs(wx - hx) <= self._HANDLE and abs(wy - hy) <= self._HANDLE:
+                return name
+        x0, y0 = self._image_to_widget(self._roi.x, self._roi.y)
+        x1, y1 = self._image_to_widget(self._roi.x1, self._roi.y1)
+        if x0 <= wx <= x1 and y0 <= wy <= y1:
+            return "move"
+        return None
+
+    def _resize_roi(self, r0, mode, dx, dy):
+        min_size = 16.0
+        if mode == "move":
+            return Roi(r0.x + dx, r0.y + dy, r0.w, r0.h)
+        if self._roi_square:
+            # anchor the opposite corner, keep it a square
+            anchors = {"nw": (r0.x1, r0.y1), "ne": (r0.x, r0.y1),
+                       "sw": (r0.x1, r0.y), "se": (r0.x, r0.y)}
+            ax, ay = anchors[mode]
+            cur_x = self._drag_start_img[0] + dx
+            cur_y = self._drag_start_img[1] + dy
+            side = max(abs(cur_x - ax), abs(cur_y - ay))
+            w_img, h_img = self._image_size()
+            side = min(side, ax if "w" in mode else w_img - ax)
+            side = min(side, ay if "n" in mode else h_img - ay)
+            side = max(side, min_size)
+            nx = ax - side if "w" in mode else ax
+            ny = ay - side if "n" in mode else ay
+            return Roi(nx, ny, side, side)
+        # free rectangle: move the dragged edge(s) only
+        x, y, x1, y1 = r0.x, r0.y, r0.x1, r0.y1
+        if "w" in mode:
+            x = min(r0.x + dx, x1 - min_size)
+        if "e" in mode:
+            x1 = max(r0.x1 + dx, x + min_size)
+        if "n" in mode:
+            y = min(r0.y + dy, y1 - min_size)
+        if "s" in mode:
+            y1 = max(r0.y1 + dy, y + min_size)
+        return Roi(x, y, x1 - x, y1 - y)
+
+    def mousePressEvent(self, event):
+        if not (self._roi_edit and self._roi is not None
+                and self._frame is not None):
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        mode = self._hit_test(event.position().toPoint())
+        if mode is None:
+            return
+        self._drag_mode = mode
+        self._drag_start_img = self._widget_to_image(
+            event.position().x(), event.position().y())
+        self._drag_start_roi = self._roi
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if not (self._roi_edit and self._roi is not None
+                and self._frame is not None):
+            return
+        if self._drag_mode is None:  # hover: reflect the action in the cursor
+            mode = self._hit_test(event.position().toPoint())
+            if mode != self._hover_mode:
+                self._hover_mode = mode
+                self.setCursor(self._CURSORS.get(mode, Qt.ArrowCursor))
+            return
+        ix, iy = self._widget_to_image(event.position().x(),
+                                       event.position().y())
+        dx = ix - self._drag_start_img[0]
+        dy = iy - self._drag_start_img[1]
+        new = self._resize_roi(self._drag_start_roi, self._drag_mode, dx, dy)
+        self._roi = new.clamped(self._image_size())
+        self.update()
+        self.roiChanged.emit(self._roi)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_mode is None:
+            return
+        self._drag_mode = None
+        if self._roi is not None:
+            self._roi = self._roi.clamped(self._image_size())
+            self.roiChanged.emit(self._roi)
+        event.accept()
 
     _STATE_COLORS = {
         "move": QColor(255, 170, 40),      # orange: bewegen
@@ -300,11 +499,27 @@ class LiveView(QLabel):
         h, w = self._frame.shape[:2]
         img = QImage(self._frame.data, w, h, self._frame.strides[0],
                      QImage.Format_Grayscale8)
-        scale = min(self.width() / w, self.height() / h)
-        dw, dh = int(w * scale), int(h * scale)
-        ox, oy = (self.width() - dw) // 2, (self.height() - dh) // 2
+        scale, ox, oy, dw, dh = self._image_transform()
         painter.drawImage(ox, oy, img.scaled(dw, dh, Qt.KeepAspectRatio,
                                              Qt.SmoothTransformation))
+
+        # --- solve-progress overlay on the frozen frame (suppresses the
+        #     stale scan overlays while the final calibration runs)
+        if self._computing:
+            painter.fillRect(ox, oy, dw, dh, QColor(0, 0, 0, 140))
+            ring_r = int(min(dw, dh) * 0.16)
+            cx, cy = ox + dw // 2, oy + dh // 2
+            painter.setPen(QPen(QColor(255, 255, 255, 60), 6))
+            painter.drawEllipse(cx - ring_r, cy - ring_r, 2 * ring_r, 2 * ring_r)
+            painter.setPen(QPen(QColor(90, 250, 140), 6, Qt.SolidLine, Qt.RoundCap))
+            painter.drawArc(cx - ring_r, cy - ring_r, 2 * ring_r, 2 * ring_r,
+                            90 * 16, int(-360 * 16 * self._compute_progress))
+            painter.setFont(QFont("Sans", 15, QFont.Bold))
+            painter.setPen(QColor(240, 240, 240))
+            painter.drawText(QRect(ox, cy + ring_r + 10, dw, 60),
+                             Qt.AlignHCenter | Qt.AlignTop, self._compute_text)
+            painter.end()
+            return
 
         # --- still-capture state: colored frame border + message
         tick = self._tick
@@ -329,20 +544,46 @@ class LiveView(QLabel):
             painter.end()
             return
 
-        # --- coverage overlay: uncovered cells clearly red, covered
-        #     cells a light green tint - full coverage reads as a
-        #     uniformly light-green image
+        # --- coverage veil, masked to the ROI: the natural image shows
+        #     through covered cells; uncovered cells inside the ROI carry a
+        #     light red tint (the area still to "free up"); everything
+        #     outside the ROI is dimmed so it reads as excluded.
+        roi = self._roi
+        roi_rect = None
+        if roi is not None:
+            rx0, ry0 = self._image_to_widget(roi.x, roi.y)
+            rx1, ry1 = self._image_to_widget(roi.x1, roi.y1)
+            roi_rect = QRectF(rx0, ry0, rx1 - rx0, ry1 - ry0)
+            dim = QPainterPath()
+            dim.addRect(QRectF(ox, oy, dw, dh))
+            dim.addRect(roi_rect)
+            dim.setFillRule(Qt.OddEvenFill)
+            painter.fillPath(dim, QColor(10, 10, 14, 110))
+
         if self._coverage_mask is not None:
             rows, cols = self._coverage_mask.shape
+            roi_cells = cells_in_roi((w, h), (cols, rows), roi)
             cw, ch = dw / cols, dh / rows
             painter.setPen(Qt.NoPen)
-            red = QBrush(QColor(225, 45, 45, 130))
-            green = QBrush(QColor(70, 220, 120, 45))
+            painter.setBrush(QBrush(QColor(225, 45, 45, 80)))
             for r in range(rows):
                 for c in range(cols):
-                    painter.setBrush(green if self._coverage_mask[r, c] else red)
-                    painter.drawRect(int(ox + c * cw), int(oy + r * ch),
-                                     int(cw + 1), int(ch + 1))
+                    if roi_cells[r, c] and not self._coverage_mask[r, c]:
+                        painter.drawRect(int(ox + c * cw), int(oy + r * ch),
+                                         int(cw + 1), int(ch + 1))
+
+        # --- ROI boundary + resize handles
+        if roi_rect is not None:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(90, 200, 255), 2))
+            painter.drawRect(roi_rect)
+            if self._roi_edit:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(90, 200, 255)))
+                hs = self._HANDLE
+                for _name, (ix, iy) in self._roi_handles().items():
+                    hx, hy = self._image_to_widget(ix, iy)
+                    painter.drawRect(int(hx - hs / 2), int(hy - hs / 2), hs, hs)
 
         # --- detected points
         color = QColor(80, 255, 120) if fb.keyframe else QColor(120, 220, 255)
@@ -486,6 +727,7 @@ class MainWindow(QMainWindow):
         self._last_fb = None
         self._solve_thread: QThread | None = None
         self._solve_worker: SolveWorker | None = None
+        self._solving = False
         self._result = None
         self._ocam_result = None
         self._result_map = None
@@ -503,6 +745,8 @@ class MainWindow(QMainWindow):
         self.cmb_model = QComboBox()
         self.lbl_target = QLabel("Testpattern")
         self.cmb_target = QComboBox()
+        self.chk_roi = QCheckBox("ROI anpassen")
+        self.chk_roi.setEnabled(False)
         self.lbl_camera = QLabel("Kamera")
         self.cmb_camera = QComboBox()
         self.lbl_camera_status = QLabel("")
@@ -523,6 +767,8 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_finish = QPushButton("Ergebnis berechnen")
         self.btn_finish.setEnabled(False)
+        self.btn_cancel = QPushButton("Abbrechen")
+        self.btn_cancel.setEnabled(False)
         self.cmb_model.currentIndexChanged.connect(self._on_model_changed)
         self.cmb_target.currentIndexChanged.connect(self._on_target_changed)
         self.cmb_camera.currentIndexChanged.connect(self._on_camera_changed)
@@ -534,6 +780,9 @@ class MainWindow(QMainWindow):
         self.btn_start.clicked.connect(self.start)
         self.btn_stop.clicked.connect(self.stop)
         self.btn_finish.clicked.connect(self.finish)
+        self.btn_cancel.clicked.connect(self.cancel_solve)
+        self.chk_roi.toggled.connect(self.view.set_roi_edit)
+        self.view.roiChanged.connect(self._on_roi_changed)
         self.spn_exposure_ms.setEnabled(self.chk_custom_exposure.isChecked())
 
         side = QVBoxLayout()
@@ -541,6 +790,7 @@ class MainWindow(QMainWindow):
         side.addWidget(self.cmb_model)
         side.addWidget(self.lbl_target)
         side.addWidget(self.cmb_target)
+        side.addWidget(self.chk_roi)
         if self._camera_mode:
             side.addWidget(self.lbl_camera)
             side.addWidget(self.cmb_camera)
@@ -554,6 +804,7 @@ class MainWindow(QMainWindow):
         side.addWidget(self.btn_start)
         side.addWidget(self.btn_stop)
         side.addWidget(self.btn_finish)
+        side.addWidget(self.btn_cancel)
         sidew = QWidget()
         sidew.setLayout(side)
         sidew.setFixedWidth(280)
@@ -608,12 +859,21 @@ class MainWindow(QMainWindow):
         self._thread.start()
         self._capture_running = True
         self._last_stats_update = 0.0
+        self.view.set_roi(
+            self._session.roi,
+            square=self._session.cfg.model is CameraModel.FISHEYE)
+        self.chk_roi.setEnabled(True)
         self.btn_start.setText("Neu starten")
         self.btn_stop.setEnabled(True)
         self.btn_finish.setEnabled(True)
         self._set_camera_controls_enabled(False)
         self.cmb_model.setEnabled(False)
         self.cmb_target.setEnabled(False)
+
+    @Slot(object)
+    def _on_roi_changed(self, roi):
+        if self._session is not None:
+            self._session.set_roi(roi)
 
     def stop(self):
         was_running = self._capture_running
@@ -628,6 +888,8 @@ class MainWindow(QMainWindow):
         self._capture_running = False
         self.btn_start.setText("Start")
         self.btn_stop.setEnabled(False)
+        self.chk_roi.setChecked(False)
+        self.chk_roi.setEnabled(False)
         self._set_camera_controls_enabled(True)
         self.cmb_model.setEnabled(True)
         self.cmb_target.setEnabled(True)
@@ -714,6 +976,8 @@ class MainWindow(QMainWindow):
     def _on_capture_finished(self):
         self._capture_running = False
         self._release_source()
+        if self._solving:
+            return  # solve overlay owns the UI; keep Start/Finish disabled
         self.btn_start.setText("Start")
         self.btn_stop.setEnabled(False)
         self._set_camera_controls_enabled(True)
@@ -885,28 +1149,55 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Zu wenig Daten",
                                 "Es wurden noch nicht genug Keyframes gesammelt.")
             return
-        self.stop()
+        self._solving = True
+        self.stop()  # also drops ROI edit mode; frozen frame stays on screen
 
         # final solve in a worker thread - the fisheye finish can take a
-        # while and used to freeze the GUI here
+        # while and used to freeze the GUI here. Progress and a cancel
+        # action are shown as an overlay on the frozen camera image.
         self.btn_finish.setEnabled(False)
         self.btn_start.setEnabled(False)
-        self.stats.setText("Ergebnis wird berechnet …\n(kann bei Fisheye"
-                           " einige Minuten dauern)")
+        self.btn_cancel.setText("Abbrechen")
+        self.btn_cancel.setEnabled(True)
+        self.stats.setText("Ergebnis wird berechnet …")
+        self.view.set_computing(True, 0.0, "Berechne… 0%")
         self._solve_worker = SolveWorker(self._session)
         self._solve_thread = QThread()
         self._solve_worker.moveToThread(self._solve_thread)
         self._solve_thread.started.connect(self._solve_worker.run)
+        self._solve_worker.progress.connect(self._on_solve_progress)
         self._solve_worker.finished.connect(self._on_solve_done)
         self._solve_worker.error.connect(self._on_solve_error)
+        self._solve_worker.cancelled.connect(self._on_solve_cancelled)
         self._solve_worker.finished.connect(self._solve_thread.quit)
         self._solve_worker.error.connect(self._solve_thread.quit)
+        self._solve_worker.cancelled.connect(self._solve_thread.quit)
         self._solve_thread.start()
+
+    def _finish_solve_ui(self):
+        """Shared teardown for every terminal solve outcome."""
+        self._solving = False
+        self.view.set_computing(False)
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setText("Abbrechen")
+        self.btn_finish.setEnabled(True)
+        self.btn_start.setEnabled(True)
+
+    @Slot(float, str)
+    def _on_solve_progress(self, percent, text):
+        self.view.set_computing(True, percent / 100.0,
+                                f"Berechne… {percent:.0f}%\n{text}")
+
+    @Slot()
+    def cancel_solve(self):
+        if self._solve_worker is not None:
+            self._solve_worker.cancel()
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setText("Abbrechen…")
 
     @Slot(object, object, object)
     def _on_solve_done(self, result, ocam_result, bgr_map):
-        self.btn_finish.setEnabled(True)
-        self.btn_start.setEnabled(True)
+        self._finish_solve_ui()
         self._result = result
         self._ocam_result = ocam_result
         self._result_map = bgr_map
@@ -917,10 +1208,16 @@ class MainWindow(QMainWindow):
             "Back to Scan  -> weiter scannen und verbessern\n"
             "Finish and Create Calibrationfile -> abschließen")
 
+    @Slot()
+    def _on_solve_cancelled(self):
+        self._finish_solve_ui()
+        self.stats.setText("Berechnung abgebrochen.\n"
+                           "Ergebnis berechnen -> erneut versuchen\n"
+                           "Start -> neu scannen")
+
     @Slot(str)
     def _on_solve_error(self, msg):
-        self.btn_finish.setEnabled(True)
-        self.btn_start.setEnabled(True)
+        self._finish_solve_ui()
         QMessageBox.critical(self, "Kalibrierung fehlgeschlagen", msg)
 
     @Slot()
@@ -950,6 +1247,10 @@ class MainWindow(QMainWindow):
         self._thread.start()
         self._capture_running = True
         self._last_stats_update = 0.0
+        self.view.set_roi(
+            self._session.roi,
+            square=self._session.cfg.model is CameraModel.FISHEYE)
+        self.chk_roi.setEnabled(True)
         self.btn_stop.setEnabled(True)
         self.btn_finish.setEnabled(True)
         self._set_camera_controls_enabled(False)

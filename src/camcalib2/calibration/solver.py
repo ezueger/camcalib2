@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -71,19 +74,58 @@ class CalibrationResult:
 MIN_POINTS_PER_VIEW = 6
 
 
+class SolveCancelled(Exception):
+    """Raised inside calibrate()/calibrate_ocam() when the cancel_event is
+    set, so a long solve unwinds promptly without a result."""
+
+
+def _check_cancel(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise SolveCancelled()
+
+
+def _report(progress_cb, frac: float, msg: str) -> None:
+    """Emit local 0..1 solve progress; ``progress_cb`` may be ``None``."""
+    if progress_cb is not None:
+        progress_cb(max(0.0, min(1.0, float(frac))), msg)
+
+
+@contextmanager
+def _solve_pool(n: int):
+    """Thread pool for independent OpenCV solves. OpenCV already uses every
+    core inside a single calibrate(), so pin it to one thread while several
+    solves run concurrently (avoids N*cores oversubscription), then restore."""
+    workers = max(1, min(int(n), os.cpu_count() or 4))
+    prev = cv2.getNumThreads()
+    cv2.setNumThreads(1)
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
+        yield ex
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+        cv2.setNumThreads(prev)
+
+
 def calibrate(views: list[ViewObservation], image_size: tuple[int, int],
               model: CameraModel = CameraModel.PINHOLE,
-              reject_outliers: bool = True) -> CalibrationResult:
+              reject_outliers: bool = True, *,
+              progress_cb=None, cancel_event=None) -> CalibrationResult:
     views = [v for v in views if len(v) >= MIN_POINTS_PER_VIEW]
     if len(views) < 3:
         raise ValueError("need at least 3 usable views")
+    _check_cancel(cancel_event)
     if model is CameraModel.PINHOLE:
-        return _calibrate_pinhole(views, image_size, reject_outliers)
-    return _calibrate_fisheye(views, image_size)
+        return _calibrate_pinhole(views, image_size, reject_outliers,
+                                  progress_cb=progress_cb,
+                                  cancel_event=cancel_event)
+    return _calibrate_fisheye(views, image_size,
+                              progress_cb=progress_cb,
+                              cancel_event=cancel_event)
 
 
 # ----------------------------------------------------------------------
-def _calibrate_pinhole(views, image_size, reject_outliers) -> CalibrationResult:
+def _calibrate_pinhole(views, image_size, reject_outliers, *,
+                       progress_cb=None, cancel_event=None) -> CalibrationResult:
     obj = [v.object_points.reshape(-1, 1, 3) for v in views]
     img = [v.image_points.reshape(-1, 1, 2) for v in views]
 
@@ -94,10 +136,13 @@ def _calibrate_pinhole(views, image_size, reject_outliers) -> CalibrationResult:
         p = o.copy()
         p[..., 2] = 0.0
         obj_planar.append(p)
+    _report(progress_cb, 0.0, "Kalibriere (planar) …")
     rms0, K, dist, _, _ = cv2.calibrateCamera(
         obj_planar, img, image_size, None, None)
 
     # pass 2: refine with the measured (non-planar) board geometry
+    _check_cancel(cancel_event)
+    _report(progress_cb, 0.4, "Kalibriere (verfeinern) …")
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         obj, img, image_size, K, dist, flags=cv2.CALIB_USE_INTRINSIC_GUESS)
 
@@ -117,6 +162,8 @@ def _calibrate_pinhole(views, image_size, reject_outliers) -> CalibrationResult:
                     marker_ids=[m for m, k in zip(v.marker_ids, keep) if k] if v.marker_ids else None,
                     timestamp=v.timestamp))
         if dropped and len(cleaned) >= 3:
+            _check_cancel(cancel_event)
+            _report(progress_cb, 0.8, "Ausreißer entfernen …")
             views = cleaned
             obj = [v.object_points.reshape(-1, 1, 3) for v in views]
             img = [v.image_points.reshape(-1, 1, 2) for v in views]
@@ -124,6 +171,7 @@ def _calibrate_pinhole(views, image_size, reject_outliers) -> CalibrationResult:
                 obj, img, image_size, K, dist, flags=cv2.CALIB_USE_INTRINSIC_GUESS)
             per_view, per_point, per_reproj = _pinhole_errors(views, K, dist, rvecs, tvecs)
 
+    _report(progress_cb, 1.0, "Fertig")
     return CalibrationResult(
         model=CameraModel.PINHOLE, image_size=tuple(image_size),
         camera_matrix=K, dist_coeffs=dist.ravel()[:5], rms=float(rms),
@@ -178,7 +226,8 @@ def _fisheye_joint(views, image_size, K0, D0):
     return rms, K, D, rvecs, tvecs, per_view, per_point, per_reproj
 
 
-def _calibrate_fisheye(views, image_size) -> CalibrationResult:
+def _calibrate_fisheye(views, image_size, *,
+                       progress_cb=None, cancel_event=None) -> CalibrationResult:
     """Robust Kannala-Brandt calibration.
 
     OpenCV's fisheye solver is fragile: the per-view homography-based
@@ -199,9 +248,10 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
     f0 = 0.32 * min(w, h)
     K0 = np.array([[f0, 0, w / 2.0], [0, f0, h / 2.0], [0, 0, 1]])
 
-    # 2) rank views by single-view fit quality (also drops broken ones)
-    ranked = []
-    for v in views:
+    # 2) rank views by single-view fit quality (also drops broken ones).
+    #    These per-view solves are independent, so run them concurrently
+    #    on a thread pool (OpenCV releases the GIL inside calibrate()).
+    def _prefilter_one(v):
         try:
             res = cv2.fisheye.calibrate(
                 [v.object_points.reshape(1, -1, 3).astype(np.float64)],
@@ -210,9 +260,21 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
                 criteria=_FISHEYE_CRIT)
             tz = abs(float(res[4][0].ravel()[2]))
             if res[0] < 5.0 and tz < 1e5:
-                ranked.append((res[0], v))
+                return (float(res[0]), v)
         except cv2.error:
-            continue
+            return None
+        return None
+
+    ranked = []
+    n_pre = max(1, len(views))
+    with _solve_pool(n_pre) as ex:
+        futs = [ex.submit(_prefilter_one, v) for v in views]
+        for done, fut in enumerate(as_completed(futs), 1):
+            _check_cancel(cancel_event)
+            r = fut.result()
+            if r is not None:
+                ranked.append(r)
+            _report(progress_cb, 0.35 * done / n_pre, "Vorfilter …")
     if len(ranked) < 3:
         raise RuntimeError("fisheye calibration failed: not enough usable views")
     ranked.sort(key=lambda x: x[0])
@@ -229,29 +291,40 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
     #    homography-based) extrinsics initialization breaks the joint
     #    solve is identified by bisecting the failing chunk
     usable = [ranked[0][1], ranked[1][1], ranked[2][1]]
+    _check_cancel(cancel_event)
     result = _fisheye_joint(usable, image_size, K0, D0)
     K, D = result[1], result[2]
     rest = [v for _, v in ranked[3:]]
     stack = [rest[i:i + 5] for i in range(0, len(rest), 5)][::-1]
+    total_rest = max(1, len(rest))
+    processed = 0
     while stack:
+        _check_cancel(cancel_event)
         chunk = stack.pop()
         try:
             cand = _fisheye_joint(usable + chunk, image_size, K, D)
             usable += chunk
             result = cand
             K, D = result[1], result[2]
+            processed += len(chunk)
         except cv2.error:
             if len(chunk) == 1:
+                processed += 1
                 continue  # single poisoned view - skip it
             mid = len(chunk) // 2
             stack.append(chunk[mid:])
             stack.append(chunk[:mid])
+        _report(progress_cb, 0.35 + 0.40 * min(1.0, processed / total_rest),
+                "Views hinzufügen …")
     rms, K, D, rvecs, tvecs, per_view, per_point, per_reproj = result
 
     # 3) iteratively drop poisoned views (stuck extrinsics show up with
     #    catastrophic per-view rms; moderate errors are handled at the
     #    point level below so rim-heavy views survive)
-    for _ in range(6):
+    for pass_i in range(6):
+        _check_cancel(cancel_event)
+        _report(progress_cb, 0.75 + 0.15 * (pass_i / 6.0),
+                "Ausreißer entfernen …")
         med = float(np.median(per_view))
         thr = max(4.0 * med, 10.0)
         keep = [i for i, e in enumerate(per_view) if e <= thr]
@@ -263,6 +336,8 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
 
     # 4) point-level outlier rejection (mirrors the pinhole path): drop
     #    individual bad observations instead of whole views, re-solve
+    _check_cancel(cancel_event)
+    _report(progress_cb, 0.92, "Punkt-Ausreißer entfernen …")
     thr_pt = max(3.0 * rms, 2.0)
     cleaned = []
     dropped = 0
@@ -283,6 +358,7 @@ def _calibrate_fisheye(views, image_size) -> CalibrationResult:
         except cv2.error:
             pass  # keep the previous solution
 
+    _report(progress_cb, 1.0, "Fertig")
     rms = float(np.sqrt(np.mean(np.concatenate(per_point) ** 2)))
     return CalibrationResult(
         model=CameraModel.FISHEYE, image_size=tuple(image_size),

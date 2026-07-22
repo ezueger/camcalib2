@@ -17,13 +17,16 @@ jointly with a sparse Levenberg-Marquardt (scipy).
 
 from __future__ import annotations
 
+import inspect
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 
 from .solver import (CalibrationResult, CameraModel, ViewObservation,
-                     _calibrate_fisheye)
+                     _calibrate_fisheye, _check_cancel, _report)
 
 
 @dataclass
@@ -135,7 +138,9 @@ class OcamCalibrationResult:
 
 def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
                    refine_affine: bool = True,
-                   refine_views: list[ViewObservation] | None = None
+                   refine_views: list[ViewObservation] | None = None,
+                   *, progress_cb=None, cancel_event=None,
+                   kb: CalibrationResult | None = None
                    ) -> OcamCalibrationResult:
     """Scaramuzza calibration bootstrapped from the robust KB solve.
 
@@ -144,6 +149,11 @@ def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
     points. The fragile OpenCV KB bootstrap runs on the conservative
     ``views``; our own bundle adjustment (warm-started extrinsics, no
     homography init) digests the extra periphery observations safely.
+
+    ``kb`` optionally supplies an already-computed Kannala-Brandt solve to
+    skip the (expensive) bootstrap - valid only when it was solved over the
+    same ``views`` (so it must not be reused together with ``refine_views``).
+    ``progress_cb(local_0_1, msg)`` and ``cancel_event`` drive the UI.
     """
     from scipy.optimize import least_squares
     from scipy.sparse import lil_matrix
@@ -151,7 +161,14 @@ def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
     if refine_views is not None and len(refine_views) != len(views):
         raise ValueError("refine_views must align with views")
 
-    kb = _calibrate_fisheye(views, image_size)
+    # bootstrap: reuse the caller's KB solve when given, else compute it
+    boot_hi = 0.0 if kb is not None else 0.25
+    if kb is None:
+        kb = _calibrate_fisheye(
+            views, image_size, cancel_event=cancel_event,
+            progress_cb=lambda f, m: _report(progress_cb, boot_hi * f, m))
+    _check_cancel(cancel_event)
+    _report(progress_cb, boot_hi + 0.02, "OCam Initialisierung …")
 
     # --- initialize the polynomial from the KB r(theta) curve.
     # The fit must cover the radius range of ALL points fed to the LM
@@ -260,41 +277,75 @@ def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
     for i in range(n_views):
         sparsity[offsets[i] * 2:offsets[i + 1] * 2, 9 + 6 * i: 15 + 6 * i] = 1
 
-    # stage 1: robust loss - initial predictions for extreme rim points
-    # can be far off (the bootstrap polynomial is only trustworthy inside
-    # its fit range); soft_l1 keeps them from dominating the solve
-    sol = least_squares(residuals, x0, jac_sparsity=sparsity, method="trf",
-                        x_scale="jac", max_nfev=200, ftol=1e-10, xtol=1e-10,
-                        loss="soft_l1", f_scale=2.0, verbose=0)
+    # progress/cancel wiring for the two LM stages: the finite-difference
+    # Jacobian is parallelized across a thread pool via ``workers`` (fresh
+    # OcamModel per residual() call -> thread-safe), and a per-iteration
+    # ``callback`` reports nfev-based progress and honours the cancel token.
+    _MAX_NFEV = 200
+    _ls_params = inspect.signature(least_squares).parameters
+    _has_cb = "callback" in _ls_params
+    _has_workers = "workers" in _ls_params
 
-    # stage 2: drop residual outliers under the converged model, then
-    # polish with a plain least-squares fit
-    m1, _ = unpack(sol.x)
-    res1 = np.linalg.norm(residuals(sol.x).reshape(-1, 2), axis=1)
-    rms1 = float(np.sqrt(np.mean(res1 ** 2)))
-    keep_thr = max(4.0 * rms1, 3.0)
-    cleaned_views = []
-    for i, v in enumerate(used_views):
-        keep = res1[offsets[i]:offsets[i + 1]] < keep_thr
-        if keep.sum() >= 6:
-            cleaned_views.append(ViewObservation(
-                v.image_points[keep], v.object_points[keep],
-                marker_ids=[mid for mid, kf in zip(v.marker_ids, keep) if kf]
-                if v.marker_ids else None, timestamp=v.timestamp))
-        else:
-            cleaned_views.append(v)
-    if sum(len(v) for v in cleaned_views) != int(offsets[-1]):
-        used_views = cleaned_views
-        counts = [len(v) for v in used_views]
-        offsets = np.concatenate([[0], np.cumsum(counts)])
-        n_res = int(offsets[-1]) * 2
-        sparsity = lil_matrix((n_res, len(x0)), dtype=int)
-        sparsity[:, :9] = 1
-        for i in range(n_views):
-            sparsity[offsets[i] * 2:offsets[i + 1] * 2, 9 + 6 * i: 15 + 6 * i] = 1
-    sol = least_squares(residuals, sol.x, jac_sparsity=sparsity, method="trf",
-                        x_scale="jac", max_nfev=200, ftol=1e-10, xtol=1e-10,
-                        verbose=0)
+    def _lm_extra(lo, hi, msg, pool):
+        extra = {}
+        if _has_workers and pool is not None:
+            extra["workers"] = pool.map
+        if _has_cb:
+            def _cb(intermediate_result):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise StopIteration  # SciPy stops cleanly (status -2)
+                nfev = getattr(intermediate_result, "nfev", None)
+                if nfev is not None:
+                    _report(progress_cb,
+                            lo + (hi - lo) * min(1.0, nfev / _MAX_NFEV), msg)
+            extra["callback"] = _cb
+        return extra
+
+    n_jac = max(1, min(os.cpu_count() or 4, 16))
+    lm1_lo = boot_hi + 0.05
+    with ThreadPoolExecutor(max_workers=n_jac) as jac_ex:
+        # stage 1: robust loss - initial predictions for extreme rim points
+        # can be far off (the bootstrap polynomial is only trustworthy
+        # inside its fit range); soft_l1 keeps them from dominating
+        sol = least_squares(residuals, x0, jac_sparsity=sparsity, method="trf",
+                            x_scale="jac", max_nfev=_MAX_NFEV, ftol=1e-10,
+                            xtol=1e-10, loss="soft_l1", f_scale=2.0, verbose=0,
+                            **_lm_extra(lm1_lo, 0.62, "OCam Feinabgleich 1 …",
+                                        jac_ex))
+        _check_cancel(cancel_event)
+
+        # stage 2: drop residual outliers under the converged model, then
+        # polish with a plain least-squares fit
+        m1, _ = unpack(sol.x)
+        res1 = np.linalg.norm(residuals(sol.x).reshape(-1, 2), axis=1)
+        rms1 = float(np.sqrt(np.mean(res1 ** 2)))
+        keep_thr = max(4.0 * rms1, 3.0)
+        cleaned_views = []
+        for i, v in enumerate(used_views):
+            keep = res1[offsets[i]:offsets[i + 1]] < keep_thr
+            if keep.sum() >= 6:
+                cleaned_views.append(ViewObservation(
+                    v.image_points[keep], v.object_points[keep],
+                    marker_ids=[mid for mid, kf in zip(v.marker_ids, keep) if kf]
+                    if v.marker_ids else None, timestamp=v.timestamp))
+            else:
+                cleaned_views.append(v)
+        if sum(len(v) for v in cleaned_views) != int(offsets[-1]):
+            used_views = cleaned_views
+            counts = [len(v) for v in used_views]
+            offsets = np.concatenate([[0], np.cumsum(counts)])
+            n_res = int(offsets[-1]) * 2
+            sparsity = lil_matrix((n_res, len(x0)), dtype=int)
+            sparsity[:, :9] = 1
+            for i in range(n_views):
+                sparsity[offsets[i] * 2:offsets[i + 1] * 2, 9 + 6 * i: 15 + 6 * i] = 1
+        _report(progress_cb, 0.66, "OCam Feinabgleich 2 …")
+        sol = least_squares(residuals, sol.x, jac_sparsity=sparsity,
+                            method="trf", x_scale="jac", max_nfev=_MAX_NFEV,
+                            ftol=1e-10, xtol=1e-10, verbose=0,
+                            **_lm_extra(0.70, 0.98, "OCam Feinabgleich 2 …",
+                                        jac_ex))
+    _check_cancel(cancel_event)
 
     m, exts = unpack(sol.x)
     per_view_rms, per_point, per_reproj, rvecs, tvecs = [], [], [], [], []
@@ -310,6 +361,7 @@ def calibrate_ocam(views: list[ViewObservation], image_size: tuple[int, int],
         tvecs.append(exts[i, 3:].reshape(3, 1))
     rms = float(np.sqrt(np.mean(np.concatenate(per_point) ** 2)))
 
+    _report(progress_cb, 1.0, "Fertig")
     return OcamCalibrationResult(
         model=m, rms=rms, per_view_rms=per_view_rms,
         n_views=n_views, n_points=int(offsets[-1]),

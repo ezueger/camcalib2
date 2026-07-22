@@ -11,6 +11,9 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "opencv-python>=4.8",
+    # >=1.16 unlocks least_squares callback/workers (fisheye solve progress,
+    # cancellation and the parallel Jacobian); older versions degrade
+    # gracefully via feature detection in calibration/ocam.py
     "scipy>=1.10",
 ]
 

@@ -19,7 +19,7 @@ from ..calibration import CalibrationResult, CameraModel, ViewObservation, calib
 from ..detection.checkerboard import CheckerboardDetector
 from ..detection.dot_marker import DotMarkerDetector
 from ..patterns.board import Checkerboard, MarkerBoard
-from .coverage import CoverageMap
+from .coverage import CoverageMap, Roi
 from .keyframes import KeyframePolicy, KeyframeSelector
 
 
@@ -125,6 +125,12 @@ class CalibrationSession:
             self._detect_precise = lambda gray: self._detect_checkerboard(gray, precise=True)
 
         self.coverage = CoverageMap(image_size)
+        # region of interest: fisheye -> centered square (usable image
+        # circle), perspective -> whole sensor. Detection and calibration
+        # ignore everything outside it, and coverage is scored over it.
+        self._roi_pad = 8
+        self.roi = Roi.default(image_size, self.cfg.model)
+        self.coverage.set_roi(self.roi)
         self.selector = KeyframeSelector(self.cfg.keyframe_policy)
         self.views: list[ViewObservation] = []
         self.state = SessionState.WAITING
@@ -258,6 +264,42 @@ class CalibrationSession:
         return fb
 
     # ------------------------------------------------------------------
+    def set_roi(self, roi: Roi) -> None:
+        """Update the region of interest (clamped to the sensor). The
+        frozen Roi reference is swapped atomically, so the capture thread's
+        single per-frame read stays consistent under the GIL."""
+        self.roi = roi.clamped(self.image_size)
+        self.coverage.set_roi(self.roi)
+
+    def _crop_for_detection(self, gray):
+        """Crop the frame to the ROI bounding box (with a small pad so
+        edge-straddling markers still decode). Returns the contiguous
+        sub-image and its origin in full-sensor pixels."""
+        x0, y0, x1, y1 = self.roi.bbox_int(self.image_size, pad=self._roi_pad)
+        return np.ascontiguousarray(gray[y0:y1, x0:x1]), x0, y0
+
+    def _filter_roi(self, ids, pts, obj):
+        """Keep only detections whose centers lie inside the ROI. ``pts``
+        must already be in full-sensor coordinates."""
+        if len(pts) == 0:
+            return ids, pts, obj
+        keep = self.roi.contains(pts)
+        obj_k = obj[keep] if obj is not None else obj
+        return [i for i, k in zip(ids, keep) if k], pts[keep], obj_k
+
+    def _detect_in_roi(self, gray, precise=False):
+        """Run detection on the ROI crop; return points in full-sensor
+        coordinates, filtered to the ROI."""
+        sub, x0, y0 = self._crop_for_detection(gray)
+        ids, pts, obj = (self._detect_precise(sub) if precise
+                         else self._detect(sub))
+        if len(pts):
+            pts = pts.astype(np.float32, copy=True)
+            pts[:, 0] += x0
+            pts[:, 1] += y0
+        return self._filter_roi(ids, pts, obj)
+
+    # ------------------------------------------------------------------
     def _detect_markers(self, gray, precise=False):
         det = self._detector_precise if precise else self._detector
         markers = det.detect(gray)
@@ -279,8 +321,7 @@ class CalibrationSession:
     def process(self, frame: np.ndarray, timestamp: float,
                 precise: bool = False) -> FrameFeedback:
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        ids, pts, obj = (self._detect_precise(gray) if precise
-                         else self._detect(gray))
+        ids, pts, obj = self._detect_in_roi(gray, precise=precise)
 
         # model-guided recovery: once a preliminary calibration exists,
         # re-measure observations the detector missed (lens periphery!).
@@ -293,6 +334,9 @@ class CalibrationSession:
             model_result = self._result
         if model_result is not None and len(ids) >= 8:
             ids, pts, obj = self._recover(gray, ids, pts, obj, model_result)
+            # recovery works on the full frame - drop any rim points it
+            # extrapolated outside the ROI
+            ids, pts, obj = self._filter_roi(ids, pts, obj)
 
         keyframe = False
         reason = "no_target"
@@ -307,7 +351,7 @@ class CalibrationSession:
                 if precise:
                     p_ids, p_pts, p_obj = ids, pts, obj
                 else:
-                    p_ids, p_pts, p_obj = self._detect_precise(gray)
+                    p_ids, p_pts, p_obj = self._detect_in_roi(gray, precise=True)
                 if len(p_ids) >= self.cfg.keyframe_policy.min_points:
                     if model_result is not None and not self._view_sane(
                             p_ids, p_pts, p_obj, model_result):
@@ -319,6 +363,8 @@ class CalibrationSession:
                                 and model_result is not None and len(p_ids) >= 8):
                             p_ids, p_pts, p_obj = self._recover(
                                 gray, p_ids, p_pts, p_obj, model_result)
+                            p_ids, p_pts, p_obj = self._filter_roi(
+                                p_ids, p_pts, p_obj)
                         self._accept_keyframe(p_ids, p_pts, p_obj, timestamp)
                 else:
                     keyframe, reason = False, "precise_detect_failed"
@@ -451,13 +497,17 @@ class CalibrationSession:
         k = min(1.0, len(self.views) / self.cfg.min_keyframes)
         return min(c, t, k)
 
-    def finish(self, wait: bool = True) -> CalibrationResult:
-        """Final full solve over all keyframes."""
+    def finish(self, wait: bool = True, *,
+               progress_cb=None, cancel_event=None) -> CalibrationResult:
+        """Final full solve over all keyframes. If ``cancel_event`` fires
+        mid-solve, ``calibrate`` raises ``SolveCancelled`` before the result
+        is stored, so the session stays in its pre-finish state."""
         if wait:
             self._solver_busy.wait(timeout=60.0)
         with self._lock:
             views = list(self.views)
-        result = calibrate(views, self.image_size, self.cfg.model)
+        result = calibrate(views, self.image_size, self.cfg.model,
+                           progress_cb=progress_cb, cancel_event=cancel_event)
         with self._lock:
             self._result = result
         self.state = SessionState.FINISHED
