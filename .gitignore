@@ -7,3 +7,5 @@ release/
 .pytest_cache/
 Results/
 *.pkl
+camcalib2-gui.spec
+.vscode/launch.json
