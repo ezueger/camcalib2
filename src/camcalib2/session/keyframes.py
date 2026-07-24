@@ -15,7 +15,16 @@ import numpy as np
 
 @dataclass
 class KeyframePolicy:
-    min_points: int = 12
+    #: absolute floor: a frame with fewer observations never becomes a
+    #: keyframe. This is the *partial-view* floor used once a preliminary
+    #: model exists (see ``min_points_bootstrap``).
+    min_points: int = 6
+    #: near-complete board required until the first model exists - the
+    #: bootstrap solve must be well-conditioned and cannot yet be
+    #: sanity-checked (no model to reproject against). It also classifies
+    #: partial vs (near-)complete views afterwards: a view below this count
+    #: only earns a keyframe by adding new coverage (see ``consider``).
+    min_points_bootstrap: int = 12
     #: minimum Laplacian variance in observation regions (blur gate)
     min_sharpness: float = 25.0
     #: median displacement (px) since last keyframe that counts as "moved"
@@ -48,14 +57,40 @@ class KeyframeSelector:
         return float(np.median(vals)) if vals else 0.0
 
     def consider(self, gray: np.ndarray, ids: list[int], points: np.ndarray,
-                 timestamp: float, new_cells: int) -> tuple[bool, str]:
+                 timestamp: float, new_cells: int, *,
+                 min_points: int | None = None,
+                 full_points: int | None = None,
+                 require_novelty: bool = False,
+                 extra_novelty: bool = False) -> tuple[bool, str]:
         """Decide whether this frame should become a keyframe.
+
+        ``min_points`` is the adaptive floor for *this* frame (fewer
+        observations never become a keyframe); ``full_points`` is the count
+        at/above which the board counts as (near-)complete. A *partial*
+        view (``min_points <= n < full_points``) only earns a keyframe by
+        adding new information, never on motion alone - this is what lets
+        the board run off the sensor edge to free up the periphery without
+        flooding the keyframe budget with redundant partial centre views.
+
+        ``require_novelty`` extends that discipline to *every* view: once a
+        preliminary model exists, a keyframe must add new sensor coverage
+        or a new board tilt (``extra_novelty``); a redundant view that only
+        moved is rejected, so the budget stays free for the corners/edges
+        that still need covering. During bootstrap (``require_novelty``
+        False) a complete view is still accepted on motion, to gather the
+        varied views the first solve needs.
+
+        All keyword flags default to the classic behaviour so direct
+        callers are unaffected.
 
         Returns (accepted, reason). ``reason`` describes the rejection or
         the acceptance trigger (useful for UI feedback).
         """
         p = self.policy
-        if len(points) < p.min_points:
+        floor = p.min_points if min_points is None else min_points
+        full = floor if full_points is None else full_points
+        n = len(points)
+        if n < floor:
             return False, "too_few_points"
         if timestamp - self._last_ts < p.min_interval:
             return False, "too_soon"
@@ -72,9 +107,21 @@ class KeyframeSelector:
                      for i in common]
                 moved = float(np.median(d)) >= p.min_motion_px
 
-        if new_cells >= p.min_new_cells or moved:
+        partial = n < full
+        adds_coverage = new_cells >= p.min_new_cells
+        novel = adds_coverage or extra_novelty
+        # motion alone only earns a keyframe for a complete view while we
+        # still lack a model; otherwise real novelty (coverage/tilt) is
+        # required.
+        accepted = novel or (moved and not partial and not require_novelty)
+        if accepted:
             self._last_points = {i: tuple(pt) for i, pt in zip(ids, points)}
             self._last_ts = timestamp
-            reason = "new_coverage" if new_cells >= p.min_new_cells else "motion"
+            if adds_coverage:
+                reason = "new_coverage"
+            elif extra_novelty:
+                reason = "new_tilt"
+            else:
+                reason = "motion"
             return True, reason
-        return False, "static"
+        return False, "partial_static" if partial else "static"

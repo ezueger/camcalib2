@@ -1,7 +1,24 @@
 import numpy as np
 
-from camcalib2.session.coverage import CoverageMap
+from camcalib2.session.coverage import CoverageMap, Roi
 from camcalib2.session.keyframes import KeyframePolicy, KeyframeSelector
+
+
+def test_coverage_elliptical_excludes_corners():
+    """Fisheye: coverage is scored over the inscribed circle, so the black
+    square-ROI corners are not counted (full coverage stays reachable)."""
+    size = (400, 400)
+    roi = Roi.full(size)
+    rect = CoverageMap(size, grid=(4, 4), roi=roi)
+    ell = CoverageMap(size, grid=(4, 4), roi=roi, elliptical=True)
+    assert rect.roi_cell_mask().all()  # rectangle: every cell eligible
+    m = ell.roi_cell_mask()
+    assert not m[0, 0] and not m[0, -1] and not m[-1, 0] and not m[-1, -1]
+    assert m[1, 1] and m[2, 2]  # centre kept
+    assert m.sum() < rect.roi_cell_mask().sum()
+    # a point in an excluded corner cell never adds coverage
+    assert ell.new_cells(np.array([[10.0, 10.0]])) == 0
+    assert ell.add_points(np.array([[10.0, 10.0]])) == 0
 
 
 def test_coverage_fraction():
@@ -22,6 +39,22 @@ def test_coverage_tilt_bins():
     assert cm.tilt_bins[:8].sum() == 1
 
 
+def test_fisheye_uses_lower_coverage_target():
+    """Fisheye converges on a lower, reachable coverage target (image
+    circle minus the hard rim ring); pinhole keeps the full 0.85."""
+    from camcalib2.calibration import CameraModel
+    from camcalib2.patterns.board import Checkerboard
+    from camcalib2.session import CalibrationSession, SessionConfig
+
+    board = Checkerboard((10, 10), 40.0)
+    size = (2448, 2048)
+    fish = CalibrationSession(board, size, SessionConfig(model=CameraModel.FISHEYE))
+    pin = CalibrationSession(board, size, SessionConfig(model=CameraModel.PINHOLE))
+    assert fish._target_coverage() == fish.cfg.fisheye_target_coverage < 0.85
+    assert pin._target_coverage() == 0.85
+    assert fish.coverage.elliptical and not pin.coverage.elliptical
+
+
 def test_keyframe_selector_gates():
     pol = KeyframePolicy(min_points=4, min_sharpness=0.0,
                          min_motion_px=10.0, min_new_cells=1, min_interval=0.0)
@@ -40,3 +73,64 @@ def test_keyframe_selector_gates():
     # too few points
     ok, reason = sel.consider(gray, ids[:2], pts[:2], 3.0, new_cells=5)
     assert not ok and reason == "too_few_points"
+
+
+def test_keyframe_partial_view_staffelung():
+    """Adaptive staffelung: below ``full_points`` a view is partial and
+    only becomes a keyframe by adding new coverage; at/above it the view
+    is (near-)complete and motion alone suffices."""
+    pol = KeyframePolicy(min_points=4, min_sharpness=0.0,
+                         min_motion_px=10.0, min_new_cells=1, min_interval=0.0)
+    gray = np.random.default_rng(0).integers(0, 255, (200, 200), np.uint8)
+    ids = [1, 2, 3, 4, 5, 6]
+    base = np.array([[20.0, 20], [60, 20], [100, 20],
+                     [20, 60], [60, 60], [100, 60]])
+
+    # --- partial view (4 of 6 points, floor=4 <= 4 < full=6)
+    sel = KeyframeSelector(pol)
+    ok, reason = sel.consider(gray, ids[:4], base[:4], 0.0, new_cells=2,
+                              min_points=4, full_points=6)
+    assert ok and reason == "new_coverage"  # earns its place by coverage
+    # partial view that only moved (no new coverage) is rejected
+    ok, reason = sel.consider(gray, ids[:4], base[:4] + 50, 1.0, new_cells=0,
+                              min_points=4, full_points=6)
+    assert not ok and reason == "partial_static"
+
+    # --- (near-)complete view (6 points >= full) is accepted on motion
+    sel = KeyframeSelector(pol)
+    ok, _ = sel.consider(gray, ids, base, 0.0, new_cells=2,
+                         min_points=4, full_points=6)
+    assert ok
+    ok, reason = sel.consider(gray, ids, base + 50, 1.0, new_cells=0,
+                              min_points=4, full_points=6)
+    assert ok and reason == "motion"
+
+    # --- bootstrap phase: floor == full, so a partial board is below the
+    #     floor and rejected outright (the first solve needs full boards)
+    sel = KeyframeSelector(pol)
+    ok, reason = sel.consider(gray, ids[:4], base[:4], 0.0, new_cells=2,
+                              min_points=6, full_points=6)
+    assert not ok and reason == "too_few_points"
+
+
+def test_keyframe_require_novelty():
+    """Once a model exists (require_novelty), a complete view that only
+    moved is rejected; a new coverage cell or a new tilt still gets in."""
+    pol = KeyframePolicy(min_points=4, min_sharpness=0.0,
+                         min_motion_px=10.0, min_new_cells=1, min_interval=0.0)
+    gray = np.random.default_rng(0).integers(0, 255, (200, 200), np.uint8)
+    ids = [1, 2, 3, 4, 5, 6]
+    base = np.array([[20.0, 20], [60, 20], [100, 20],
+                     [20, 60], [60, 60], [100, 60]])
+
+    sel = KeyframeSelector(pol)
+    ok, _ = sel.consider(gray, ids, base, 0.0, new_cells=2, require_novelty=True)
+    assert ok
+    # moved but no new coverage and no new tilt -> rejected (was "motion")
+    ok, reason = sel.consider(gray, ids, base + 50, 1.0, new_cells=0,
+                              require_novelty=True)
+    assert not ok and reason == "static"
+    # a new tilt direction still earns the keyframe
+    ok, reason = sel.consider(gray, ids, base + 80, 2.0, new_cells=0,
+                              require_novelty=True, extra_novelty=True)
+    assert ok and reason == "new_tilt"

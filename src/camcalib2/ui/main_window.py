@@ -306,6 +306,7 @@ class LiveView(QLabel):
         self._roi: Roi | None = None
         self._roi_edit = False
         self._roi_square = False
+        self._roi_elliptical = False  # fisheye: coverage over the image circle
         self._drag_mode: str | None = None
         self._drag_start_img: tuple[float, float] | None = None
         self._drag_start_roi: Roi | None = None
@@ -338,9 +339,10 @@ class LiveView(QLabel):
         self.update()
 
     # --- ROI editing --------------------------------------------------
-    def set_roi(self, roi, square: bool = False):
+    def set_roi(self, roi, square: bool = False, elliptical: bool = False):
         self._roi = roi
         self._roi_square = square
+        self._roi_elliptical = elliptical
         self.update()
 
     def set_roi_edit(self, on: bool):
@@ -562,7 +564,8 @@ class LiveView(QLabel):
 
         if self._coverage_mask is not None:
             rows, cols = self._coverage_mask.shape
-            roi_cells = cells_in_roi((w, h), (cols, rows), roi)
+            roi_cells = cells_in_roi((w, h), (cols, rows), roi,
+                                     self._roi_elliptical)
             cw, ch = dw / cols, dh / rows
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(QColor(225, 45, 45, 80)))
@@ -621,7 +624,8 @@ class LiveView(QLabel):
             return "Kamera bewegen: Pattern über den ganzen Sensor führen"
         if fb.tilt_coverage < 0.5:
             return "Pattern aus schrägeren Winkeln aufnehmen"
-        return "Weiter abtasten - Ecken und Ränder nicht vergessen"
+        return ("Ränder/Ecken abdecken - Pattern darf über den Bildrand "
+                "hinausragen, sichtbare Marker genügen")
 
 
 class ResultView(QWidget):
@@ -861,7 +865,8 @@ class MainWindow(QMainWindow):
         self._last_stats_update = 0.0
         self.view.set_roi(
             self._session.roi,
-            square=self._session.cfg.model is CameraModel.FISHEYE)
+            square=self._session.cfg.model is CameraModel.FISHEYE,
+            elliptical=self._session.cfg.model is CameraModel.FISHEYE)
         self.chk_roi.setEnabled(True)
         self.btn_start.setText("Neu starten")
         self.btn_stop.setEnabled(True)
@@ -951,6 +956,7 @@ class MainWindow(QMainWindow):
             return
         lines = [
             f"Status {fb.state.value} | Marker {len(fb.ids)} | KF {fb.n_keyframes}",
+            f"Letzter Frame: Punkte {len(fb.points)} | Keyframe {'JA' if fb.keyframe else 'nein'} | Grund: {fb.reason}",
             f"Abd {fb.coverage*100:.0f}% | Winkel {fb.tilt_coverage*100:.0f}%",
             f"Laufz {metrics.elapsed_s:6.1f}s | Cap {metrics.capture_fps:4.1f} fps | UI {metrics.display_fps:4.1f} fps",
             f"Frames {metrics.captured_frames}/{metrics.displayed_frames} | Drops {metrics.dropped_previews}",
@@ -1249,7 +1255,8 @@ class MainWindow(QMainWindow):
         self._last_stats_update = 0.0
         self.view.set_roi(
             self._session.roi,
-            square=self._session.cfg.model is CameraModel.FISHEYE)
+            square=self._session.cfg.model is CameraModel.FISHEYE,
+            elliptical=self._session.cfg.model is CameraModel.FISHEYE)
         self.chk_roi.setEnabled(True)
         self.btn_stop.setEnabled(True)
         self.btn_finish.setEnabled(True)

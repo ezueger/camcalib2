@@ -9,3 +9,4 @@ Results/
 *.pkl
 camcalib2-gui.spec
 .vscode/launch.json
+tools/live_snapshot.png

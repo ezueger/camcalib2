@@ -57,9 +57,15 @@ class StillTick:
 class SessionConfig:
     model: CameraModel = CameraModel.PINHOLE
     target_coverage: float = 0.85
+    #: fisheye only fills the image *circle* (coverage is scored over it),
+    #: and the outermost rim ring is very hard to cover hand-held (heavy
+    #: distortion + partial board). A lower, realistically reachable target
+    #: lets the session actually reach the converged/"done" state; the rim
+    #: is refined by the OCam recovery on export anyway.
+    fisheye_target_coverage: float = 0.70
     target_tilt_fraction: float = 0.5
     min_keyframes: int = 12
-    max_keyframes: int = 60
+    max_keyframes: int = 80
     #: recalibrate every N new keyframes
     recalib_every: int = 4
     #: skip the background recalibration above this many views for
@@ -124,7 +130,11 @@ class CalibrationSession:
             self._detect = self._detect_checkerboard
             self._detect_precise = lambda gray: self._detect_checkerboard(gray, precise=True)
 
-        self.coverage = CoverageMap(image_size)
+        # fisheye: the usable image is a circle inside the square ROI, so
+        # score coverage over that circle - otherwise the black corners
+        # keep "coverage" (and convergence) from ever completing.
+        self.coverage = CoverageMap(
+            image_size, elliptical=self.cfg.model is CameraModel.FISHEYE)
         # region of interest: fisheye -> centered square (usable image
         # circle), perspective -> whole sensor. Detection and calibration
         # ignore everything outside it, and coverage is scored over it.
@@ -318,6 +328,25 @@ class CalibrationSession:
         return ids, det.image_points, det.object_points
 
     # ------------------------------------------------------------------
+    def _point_floor(self, have_model: bool) -> tuple[int, int]:
+        """Adaptive keyframe point thresholds ``(floor, full)`` for the
+        current phase.
+
+        While bootstrapping (no model yet) the floor equals ``full`` so the
+        first solve is built from (near-)complete boards - it must be
+        well-conditioned and cannot be sanity-checked yet. Once a
+        preliminary model exists the floor relaxes to the partial value:
+        the board may run off the sensor edge and be measured from just the
+        visible markers, which is what frees up the periphery. Those
+        partial views are guarded by the ``_view_sane`` PnP gate, and
+        ``consider`` only turns a partial view into a keyframe when it adds
+        new coverage. For checkerboards the detector's own ``min_corners``
+        raises the effective floor (a tiny partial grid can mis-index)."""
+        pol = self.cfg.keyframe_policy
+        full = pol.min_points_bootstrap
+        return (pol.min_points if have_model else full), full
+
+    # ------------------------------------------------------------------
     def process(self, frame: np.ndarray, timestamp: float,
                 precise: bool = False) -> FrameFeedback:
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -344,7 +373,17 @@ class CalibrationSession:
             if self.state is SessionState.WAITING:
                 self.state = SessionState.SCANNING
             new_cells = self.coverage.new_cells(pts)
-            keyframe, reason = self.selector.consider(gray, ids, pts, timestamp, new_cells)
+            have_model = model_result is not None
+            # once a model exists a keyframe must earn its slot with real
+            # novelty (new coverage or a new tilt direction) rather than
+            # mere motion - otherwise redundant near-frontal views exhaust
+            # the budget before the corners/edges are covered.
+            new_tilt = self.coverage.tilt_is_new(*self._tilt(pts, obj))
+            floor, full = self._point_floor(have_model)
+            keyframe, reason = self.selector.consider(
+                gray, ids, pts, timestamp, new_cells,
+                min_points=floor, full_points=full,
+                require_novelty=have_model, extra_novelty=new_tilt)
             if keyframe:
                 # the live loop ran the fast preview detector; re-detect
                 # this one frame precisely (sub-pixel) for the calibration
@@ -352,7 +391,7 @@ class CalibrationSession:
                     p_ids, p_pts, p_obj = ids, pts, obj
                 else:
                     p_ids, p_pts, p_obj = self._detect_in_roi(gray, precise=True)
-                if len(p_ids) >= self.cfg.keyframe_policy.min_points:
+                if len(p_ids) >= floor:
                     if model_result is not None and not self._view_sane(
                             p_ids, p_pts, p_obj, model_result):
                         keyframe, reason = False, "detection_rejected"
@@ -491,8 +530,16 @@ class CalibrationSession:
             self._solver_busy.clear()
 
     # ------------------------------------------------------------------
+    def _target_coverage(self) -> float:
+        """Coverage fraction that counts as fully scanned - lower for
+        fisheye, whose reachable region is only the image circle minus the
+        hard-to-fill rim ring."""
+        if self.cfg.model is CameraModel.FISHEYE:
+            return self.cfg.fisheye_target_coverage
+        return self.cfg.target_coverage
+
     def _progress(self) -> float:
-        c = min(1.0, self.coverage.fraction / self.cfg.target_coverage)
+        c = min(1.0, self.coverage.fraction / self._target_coverage())
         t = min(1.0, self.coverage.tilt_fraction / self.cfg.target_tilt_fraction)
         k = min(1.0, len(self.views) / self.cfg.min_keyframes)
         return min(c, t, k)

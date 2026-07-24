@@ -86,11 +86,17 @@ class Roi:
 
 
 def cells_in_roi(image_size: tuple[int, int], grid: tuple[int, int],
-                 roi: Roi | None) -> np.ndarray:
-    """``(rows, cols)`` bool mask of grid cells that intersect the ROI.
+                 roi: Roi | None, elliptical: bool = False) -> np.ndarray:
+    """``(rows, cols)`` bool mask of grid cells that count towards coverage.
 
     A cell is eligible when its pixel rectangle overlaps the ROI at all;
     ``roi is None`` marks every cell eligible.
+
+    ``elliptical`` restricts eligibility further to the ellipse inscribed in
+    the ROI (a cell also needs its centre inside that ellipse). This models
+    the fisheye image circle: the black corners of the square ROI can never
+    hold the pattern, so counting them would make full coverage - and thus
+    the "converged" state - unreachable.
     """
     cols, rows = grid
     if roi is None:
@@ -102,7 +108,15 @@ def cells_in_roi(image_size: tuple[int, int], grid: tuple[int, int],
     cy1 = (np.arange(rows) + 1) * (h / rows)
     col_hit = (cx1 > roi.x) & (cx0 < roi.x1)  # (cols,)
     row_hit = (cy1 > roi.y) & (cy0 < roi.y1)  # (rows,)
-    return row_hit[:, None] & col_hit[None, :]
+    hit = row_hit[:, None] & col_hit[None, :]
+    if not elliptical:
+        return hit
+    ax, ay = max(roi.w / 2.0, 1e-6), max(roi.h / 2.0, 1e-6)
+    ex, ey = roi.x + ax, roi.y + ay
+    ccx = ((np.arange(cols) + 0.5) * (w / cols) - ex) / ax  # (cols,)
+    ccy = ((np.arange(rows) + 0.5) * (h / rows) - ey) / ay  # (rows,)
+    inside = (ccy[:, None] ** 2 + ccx[None, :] ** 2) <= 1.0
+    return hit & inside
 
 
 @dataclass
@@ -113,19 +127,24 @@ class CoverageMap:
     #: tilt direction histogram: 8 directions + 1 frontal bin
     tilt_bins: np.ndarray = field(init=False)
     roi: Roi | None = None
+    #: score coverage over the ellipse inscribed in the ROI (fisheye image
+    #: circle) instead of the full ROI rectangle
+    elliptical: bool = False
 
     def __post_init__(self):
         cols, rows = self.grid
         self.counts = np.zeros((rows, cols), dtype=np.int32)
         self.tilt_bins = np.zeros(9, dtype=np.int32)
-        self._roi_cells = cells_in_roi(self.image_size, self.grid, self.roi)
+        self._roi_cells = cells_in_roi(self.image_size, self.grid, self.roi,
+                                       self.elliptical)
 
     # ------------------------------------------------------------------
     def set_roi(self, roi: Roi | None) -> None:
         """Restrict coverage to ``roi``.  ``counts`` are kept, so editing
         the ROI live never discards already-collected progress."""
         self.roi = roi
-        self._roi_cells = cells_in_roi(self.image_size, self.grid, roi)
+        self._roi_cells = cells_in_roi(self.image_size, self.grid, roi,
+                                       self.elliptical)
 
     def roi_cell_mask(self) -> np.ndarray:
         """Boolean (rows, cols) array of cells that belong to the ROI."""
@@ -164,13 +183,22 @@ class CoverageMap:
             return 0
         return int((self.counts.ravel()[cells] == 0).sum())
 
+    @staticmethod
+    def _tilt_bin(tilt_dir: float | None, tilt_mag: float) -> int:
+        """Histogram bin for a board tilt: 0..7 by direction, 8 = frontal."""
+        if tilt_mag < 0.15 or tilt_dir is None:
+            return 8
+        return int(((tilt_dir + np.pi) / (2 * np.pi) * 8)) % 8
+
     def add_tilt(self, tilt_dir: float | None, tilt_mag: float) -> None:
         """Record board tilt: direction in rad, magnitude 0..1 (0=frontal)."""
-        if tilt_mag < 0.15 or tilt_dir is None:
-            self.tilt_bins[8] += 1
-        else:
-            b = int(((tilt_dir + np.pi) / (2 * np.pi) * 8)) % 8
-            self.tilt_bins[b] += 1
+        self.tilt_bins[self._tilt_bin(tilt_dir, tilt_mag)] += 1
+
+    def tilt_is_new(self, tilt_dir: float | None, tilt_mag: float) -> bool:
+        """Whether this tilt would fill a directional bin not yet seen.
+        Frontal views (bin 8) never count as new tilt information."""
+        b = self._tilt_bin(tilt_dir, tilt_mag)
+        return b < 8 and self.tilt_bins[b] == 0
 
     # ------------------------------------------------------------------
     @property
