@@ -6,18 +6,20 @@ import threading
 import time
 from dataclasses import dataclass
 import numpy as np
-from PySide6.QtCore import QObject, QPoint, QRect, QRectF, Qt, QThread, Signal, Slot
+from PySide6.QtCore import (QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread,
+                            Signal, Slot)
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter,
-                           QPainterPath, QPen, QPixmap)
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
-                               QFileDialog, QHBoxLayout, QLabel, QMainWindow,
-                               QMessageBox, QPushButton, QStackedWidget,
+                           QPainterPath, QPen, QPixmap, QPolygonF)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
+                               QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel,
+                               QMainWindow, QMessageBox, QPlainTextEdit,
+                               QPushButton, QStackedWidget, QTabWidget,
                                QVBoxLayout, QWidget)
 
 from ..calibration import CameraModel
 from ..capture.source import FrameSource
-from ..session import (CalibrationSession, FrameFeedback, Roi, SessionConfig,
-                       SessionState, cells_in_roi)
+from ..session import (CalibrationSession, FrameFeedback, REASON_TEXT, Roi,
+                       SessionConfig, SessionState)
 
 
 class SolveWorker(QObject):
@@ -176,6 +178,16 @@ class CaptureWorker(QObject):
                     ts = time.perf_counter() - monotonic0
                 process_started = time.perf_counter()
 
+                if self.session is None:
+                    # preview-only: show the live stream, no measurement
+                    metrics = self._record_processed_frame(
+                        time.perf_counter() - process_started)
+                    if self._begin_preview_delivery():
+                        self.framePreview.emit(frame, None, metrics)
+                    else:
+                        self._record_dropped_preview()
+                    continue
+
                 # deliver a completed evaluation (coverage/points update)
                 if self._eval_result is not None:
                     eframe, efb = self._eval_result
@@ -301,7 +313,7 @@ class LiveView(QLabel):
         self._frame: np.ndarray | None = None
         self._fb: FrameFeedback | None = None
         self._tick = None  # StillTick of the latest preview frame
-        self._coverage_mask: np.ndarray | None = None
+        self._coverage_veil: np.ndarray | None = None  # (rows,cols) red opacity 0..1
         # region of interest editing
         self._roi: Roi | None = None
         self._roi_edit = False
@@ -316,19 +328,28 @@ class LiveView(QLabel):
         self._compute_progress = 0.0
         self._compute_text = ""
 
-    def update_frame(self, frame: np.ndarray, fb: FrameFeedback, coverage_mask):
+    def update_frame(self, frame: np.ndarray, fb: FrameFeedback, coverage_veil):
         self._frame = frame
         self._fb = fb
-        self._coverage_mask = coverage_mask
+        self._coverage_veil = coverage_veil
         self.update()
 
-    def update_preview(self, frame: np.ndarray, tick, coverage_mask):
+    def update_preview(self, frame: np.ndarray, tick, coverage_veil):
         """Every camera frame: fresh image + capture-state overlay; the
         last evaluation's points/coverage stay visible."""
         self._frame = frame
         self._tick = tick
-        if coverage_mask is not None:
-            self._coverage_mask = coverage_mask
+        if coverage_veil is not None:
+            self._coverage_veil = coverage_veil
+        self.update()
+
+    def reset_overlay(self):
+        """Drop any scan overlay (last feedback, coverage veil, ROI) - used
+        for a plain camera preview that shows only the live image."""
+        self._fb = None
+        self._tick = None
+        self._coverage_veil = None
+        self._roi = None
         self.update()
 
     def set_computing(self, active: bool, progress: float = 0.0, text: str = ""):
@@ -541,15 +562,9 @@ class LiveView(QLabel):
             painter.setPen(color)
             painter.drawText(ox + 14, oy + 30, tick.message)
 
-        fb = self._fb
-        if fb is None:
-            painter.end()
-            return
-
-        # --- coverage veil, masked to the ROI: the natural image shows
-        #     through covered cells; uncovered cells inside the ROI carry a
-        #     light red tint (the area still to "free up"); everything
-        #     outside the ROI is dimmed so it reads as excluded.
+        # --- ROI: dim outside + boundary/handles. Drawn regardless of a
+        #     FrameFeedback, so the ROI is visible and adjustable already in
+        #     the measurement-free preview (where fb is None).
         roi = self._roi
         roi_rect = None
         if roi is not None:
@@ -562,20 +577,21 @@ class LiveView(QLabel):
             dim.setFillRule(Qt.OddEvenFill)
             painter.fillPath(dim, QColor(10, 10, 14, 110))
 
-        if self._coverage_mask is not None:
-            rows, cols = self._coverage_mask.shape
-            roi_cells = cells_in_roi((w, h), (cols, rows), roi,
-                                     self._roi_elliptical)
+        fb = self._fb
+        # coverage veil (scan only): uncovered cells carry a red tint whose
+        # opacity grows with under-coverage; a cell covered this run is clear.
+        if fb is not None and self._coverage_veil is not None:
+            rows, cols = self._coverage_veil.shape
             cw, ch = dw / cols, dh / rows
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(QColor(225, 45, 45, 80)))
             for r in range(rows):
                 for c in range(cols):
-                    if roi_cells[r, c] and not self._coverage_mask[r, c]:
+                    a = float(self._coverage_veil[r, c])
+                    if a > 0.01:
+                        painter.setBrush(QBrush(QColor(225, 45, 45, int(40 + 150 * a))))
                         painter.drawRect(int(ox + c * cw), int(oy + r * ch),
                                          int(cw + 1), int(ch + 1))
 
-        # --- ROI boundary + resize handles
         if roi_rect is not None:
             painter.setBrush(Qt.NoBrush)
             painter.setPen(QPen(QColor(90, 200, 255), 2))
@@ -588,6 +604,10 @@ class LiveView(QLabel):
                     hx, hy = self._image_to_widget(ix, iy)
                     painter.drawRect(int(hx - hs / 2), int(hy - hs / 2), hs, hs)
 
+        if fb is None:
+            painter.end()
+            return
+
         # --- detected points
         color = QColor(80, 255, 120) if fb.keyframe else QColor(120, 220, 255)
         painter.setPen(QPen(color, 2))
@@ -595,25 +615,57 @@ class LiveView(QLabel):
         for x, y in fb.points:
             painter.drawEllipse(int(ox + x * scale) - 3, int(oy + y * scale) - 3, 6, 6)
 
-        # --- FaceTime-style progress ring (center)
+        # --- center: progress ring while scanning, a big success check once
+        #     the scan is complete (so "nothing turns green anymore" reads as
+        #     DONE, not broken)
         ring_r = int(min(dw, dh) * 0.16)
         cx, cy = ox + dw // 2, oy + dh // 2
-        painter.setPen(QPen(QColor(255, 255, 255, 60), 6))
-        painter.drawEllipse(cx - ring_r, cy - ring_r, 2 * ring_r, 2 * ring_r)
-        painter.setPen(QPen(QColor(90, 250, 140), 6, Qt.SolidLine, Qt.RoundCap))
-        span = int(-360 * 16 * fb.progress)
-        painter.drawArc(cx - ring_r, cy - ring_r, 2 * ring_r, 2 * ring_r, 90 * 16, span)
+        converged = fb.state in (SessionState.CONVERGED, SessionState.FINISHED)
+        if converged:
+            painter.setBrush(QBrush(QColor(20, 40, 25, 190)))
+            painter.setPen(QPen(QColor(80, 230, 120), 8))
+            painter.drawEllipse(cx - ring_r, cy - ring_r, 2 * ring_r, 2 * ring_r)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(120, 240, 150), 12, Qt.SolidLine,
+                                Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPolyline(QPolygonF([
+                QPointF(cx - 0.42 * ring_r, cy + 0.02 * ring_r),
+                QPointF(cx - 0.12 * ring_r, cy + 0.34 * ring_r),
+                QPointF(cx + 0.46 * ring_r, cy - 0.34 * ring_r)]))
+        else:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(255, 255, 255, 60), 6))
+            painter.drawEllipse(cx - ring_r, cy - ring_r, 2 * ring_r, 2 * ring_r)
+            painter.setPen(QPen(QColor(90, 250, 140), 6, Qt.SolidLine, Qt.RoundCap))
+            span = int(-360 * 16 * fb.progress)
+            painter.drawArc(cx - ring_r, cy - ring_r, 2 * ring_r, 2 * ring_r, 90 * 16, span)
 
-        # --- status text
-        painter.setFont(QFont("Sans", 11, QFont.Bold))
-        painter.setPen(QColor(240, 240, 240))
-        msg = {
-            SessionState.WAITING: "Pattern vor die Kamera halten …",
-            SessionState.SCANNING: self._hint(fb),
-            SessionState.CONVERGED: "Fertig! Kalibrierung konvergiert ✓",
-            SessionState.FINISHED: "Abgeschlossen.",
-        }[fb.state]
-        painter.drawText(ox + 12, oy + dh - 14, msg)
+        # --- status text (bottom)
+        if converged:
+            painter.setFont(QFont("Sans", 15, QFont.Bold))
+            painter.setPen(QColor(120, 240, 150))
+            painter.drawText(QRect(ox, cy + ring_r + 14, dw, 34),
+                             Qt.AlignHCenter | Qt.AlignTop,
+                             "Scan erfolgreich – Auswertung kann beginnen")
+            painter.setFont(QFont("Sans", 10))
+            painter.setPen(QColor(215, 225, 215))
+            painter.drawText(QRect(ox, cy + ring_r + 46, dw, 28),
+                             Qt.AlignHCenter | Qt.AlignTop,
+                             "Rechts „Abschließen zur Berechnung“ – oder weiter verdichten")
+        else:
+            painter.setFont(QFont("Sans", 11, QFont.Bold))
+            painter.setPen(QColor(240, 240, 240))
+            msg = ("Pattern vor die Kamera halten …"
+                   if fb.state is SessionState.WAITING else self._hint(fb))
+            painter.drawText(ox + 12, oy + dh - 34, msg)
+            # why the last settled evaluation did NOT capture (still-capture
+            # feedback - otherwise a rejection silently re-arms "hold still")
+            if fb.state is SessionState.SCANNING and not fb.keyframe:
+                txt = REASON_TEXT.get(fb.reason, fb.reason)
+                painter.setFont(QFont("Sans", 11, QFont.Bold))
+                painter.setPen(QColor(255, 175, 90))
+                painter.drawText(ox + 12, oy + dh - 14,
+                                 f"Zuletzt nicht aufgenommen: {txt}")
         painter.end()
 
     @staticmethod
@@ -628,12 +680,236 @@ class LiveView(QLabel):
                 "hinausragen, sichtbare Marker genügen")
 
 
+def assess_calibration(result, ocam_result, *, coverage=None, tilt=None,
+                       target_coverage: float = 0.85):
+    """Layman-friendly quality assessment.
+
+    Returns ``(verdict, color_hex, details)`` where ``details`` explains what
+    the numbers mean and, when the result is weak, what to do on a follow-up
+    scan. ``coverage``/``tilt`` are the session's sensor-coverage and tilt
+    fractions (0..1); pass ``None`` if unknown.
+    """
+    rms = ocam_result.rms if ocam_result is not None else result.rms
+    errs = (np.concatenate(result.per_point_errors)
+            if result.per_point_errors else np.empty(0))
+    total = int(errs.size)
+    bad = int((errs > 2.0).sum())
+    bad_frac = bad / total if total else 0.0
+
+    if rms < 0.5:
+        rms_word = "sehr gut (unter 0,5 px)"
+    elif rms < 1.0:
+        rms_word = "gut"
+    elif rms < 2.0:
+        rms_word = "brauchbar, aber verbesserbar"
+    else:
+        rms_word = "hoch – deutet auf Ausreißer oder zu wenig Vielfalt hin"
+
+    lines = [
+        "Was das Ergebnis bedeutet:",
+        f"• Genauigkeit (mittl. Reprojektionsfehler): {rms:.2f} px – {rms_word}. "
+        "Kleiner ist besser: der typische Abstand zwischen erkanntem und "
+        "vom Modell vorhergesagtem Punkt.",
+    ]
+    if total:
+        lines.append(f"• Punkte: {total} verwendet, davon {bad} auffällig "
+                     f"(>2 px) = {bad_frac * 100:.0f} %.")
+    if coverage is not None:
+        cov_word = ("gut abgedeckt" if coverage >= 0.9 * target_coverage
+                    else "lückenhaft")
+        lines.append(f"• Abdeckung des Bildbereichs: {coverage * 100:.0f} % – {cov_word}.")
+    if tilt is not None:
+        tilt_word = "genug Winkel" if tilt >= 0.5 else "zu wenig gekippt"
+        lines.append(f"• Blickwinkel-Vielfalt: {tilt * 100:.0f} % der Richtungen – {tilt_word}.")
+
+    tips = []
+    if tilt is not None and tilt < 0.5:
+        tips.append("Kippe das Board deutlich stärker (nach links/rechts/oben/"
+                    "unten neigen, nicht nur frontal halten) – die schrägen "
+                    "Ansichten bestimmen die Linsenverzeichnung und senken den "
+                    "Fehler am meisten.")
+    if coverage is not None and coverage < 0.9 * target_coverage:
+        tips.append("Führe das Board bis an die Bildränder und in die Ecken "
+                    "(bei Fisheye bis zum Rand des Bildkreises) – dunkelrote "
+                    "Zonen zeigen, wo noch etwas fehlt.")
+    if bad_frac > 0.15:
+        tips.append("Scanne langsamer und halte beim Aufnehmen kurz still – "
+                    "viele auffällige Punkte kommen von Bewegungsunschärfe.")
+
+    n = len(tips)
+    if rms < 1.0 and n == 0:
+        verdict, color = "Sehr gut – direkt verwendbar", "#2e9e4f"
+    elif rms < 2.0 and n <= 1:
+        verdict, color = "Brauchbar – für mehr Genauigkeit nachscannen", "#c9a227"
+    else:
+        verdict, color = "Besser nachscannen", "#d9534f"
+
+    lines.append("")
+    if tips:
+        lines.append('So verbesserst du es – „Zurück zum Scannen" und dort '
+                     '„Zusätzlich drüberscannen":')
+        lines.extend(f"→ {t}" for t in tips)
+    else:
+        lines.append("Keine Schwächen erkannt – die Kalibrierung kann so "
+                     "übernommen werden.")
+    return verdict, color, "\n".join(lines)
+
+
+def calibration_strings(result, ocam_result, camera_id: str,
+                        pixel_size_mm: float | None = None) -> tuple[str, str]:
+    """``(json_str, xml_str)`` of the calibration for the dataset viewer.
+
+    The XML is produced by the very writers used for the exported file (via a
+    throwaway temp file) so what the user copies matches the exported file;
+    the JSON is a compact parameter dump.
+    """
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+    from ..io.export import write_ocam_xml, write_vendor_xml
+
+    data = {
+        "camera_id": camera_id,
+        "model": result.model.value,
+        "image_width": int(result.image_size[0]),
+        "image_height": int(result.image_size[1]),
+        "fx": round(float(result.fx), 6),
+        "fy": round(float(result.fy), 6),
+        "cx": round(float(result.cx), 6),
+        "cy": round(float(result.cy), 6),
+        "dist_coeffs": [round(float(v), 8)
+                        for v in np.asarray(result.dist_coeffs).ravel()],
+        "rms_px": round(float(result.rms), 6),
+        "n_views": int(result.n_views),
+        "n_points": int(result.n_points),
+    }
+    if ocam_result is not None:
+        m = ocam_result.model
+        data["ocam"] = {
+            "cx": round(float(m.cx), 6), "cy": round(float(m.cy), 6),
+            "c": round(float(m.c), 8), "d": round(float(m.d), 8),
+            "e": round(float(m.e), 8),
+            "poly": [round(float(v), 8) for v in m.poly],
+            "rms_px": round(float(ocam_result.rms), 6),
+        }
+    json_str = json.dumps(data, indent=2)
+
+    pts = np.vstack(result.used_image_points) if result.used_image_points else None
+    errs = (np.concatenate(result.per_point_errors)
+            if result.per_point_errors else None)
+    fd, tmp = tempfile.mkstemp(suffix=".xml")
+    os.close(fd)
+    try:
+        if ocam_result is not None:
+            opts = (np.vstack(ocam_result.used_image_points)
+                    if ocam_result.used_image_points else pts)
+            write_ocam_xml(ocam_result, tmp, camera_id, points=opts)
+        else:
+            ps = (pixel_size_mm, pixel_size_mm) if pixel_size_mm else None
+            write_vendor_xml(result, tmp, camera_id, pixel_size_mm=ps,
+                             points=pts, errors=errs)
+        xml_str = Path(tmp).read_text(encoding="utf-8")
+    finally:
+        os.remove(tmp)
+    return json_str, xml_str
+
+
+def error_stats_text(result, ocam_result) -> str:
+    """One-line-ish reprojection-error breakdown for the result dataset view,
+    from the same source (OCam for fisheye, else pinhole) as the map."""
+    src = ocam_result if ocam_result is not None else result
+    errs = (np.concatenate(src.per_point_errors)
+            if getattr(src, "per_point_errors", None) else np.empty(0))
+    if errs.size == 0:
+        return "Keine Fehlerdaten verfügbar."
+    n = int(errs.size)
+
+    def pct(mask):
+        return 100.0 * int(np.count_nonzero(mask)) / n
+    return (
+        f"Reprojektionsfehler über {n} Punkte (Abstand erkannt ↔ vorhergesagt):\n"
+        f"  Median {np.median(errs):.2f} px   Mittel {errs.mean():.2f} px   "
+        f"Max {errs.max():.2f} px\n"
+        f"  ≤1px: {pct(errs <= 1):.0f}%    ≤2px: {pct(errs <= 2):.0f}%    "
+        f"≤3px: {pct(errs <= 3):.0f}%    >3px: {pct(errs > 3):.0f}%\n"
+        "Die Karte zeigt jeden Punkt als Fehlervektor (grün ≤1px … rot >3px); "
+        "blauer Kreis = Vertrauensradius um den Bildmittelpunkt.")
+
+
+class ResultDatasetDialog(QDialog):
+    """Popup with the calibration dataset: XML and JSON tabs (each with a
+    copy-to-clipboard button) plus a 'Fehlerkarte' tab (coverage/error map +
+    error breakdown)."""
+
+    def __init__(self, xml_str: str, json_str: str, result_map=None,
+                 stats_text: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Kalibrierergebnis")
+        self.resize(700, 580)
+        tabs = QTabWidget()
+        for label, text in (("XML", xml_str), ("JSON", json_str)):
+            page = QWidget()
+            edit = QPlainTextEdit(text)
+            edit.setReadOnly(True)
+            edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+            edit.setStyleSheet("font-family: monospace;")
+            btn = QPushButton(f"{label} in Zwischenablage kopieren")
+            btn.clicked.connect(lambda _checked=False, t=text, b=btn:
+                                self._copy(t, b))
+            v = QVBoxLayout()
+            v.addWidget(edit, 1)
+            v.addWidget(btn)
+            page.setLayout(v)
+            tabs.addTab(page, label)
+
+        if result_map is not None:
+            page = QWidget()
+            v = QVBoxLayout()
+            img = QLabel()
+            img.setAlignment(Qt.AlignCenter)
+            img.setMinimumSize(480, 360)
+            img.setStyleSheet("background-color: #101014;")
+            h, w = result_map.shape[:2]
+            qimg = QImage(result_map.data, w, h, result_map.strides[0],
+                          QImage.Format_BGR888)
+            img.setPixmap(QPixmap.fromImage(qimg.copy()).scaled(
+                600, 440, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            v.addWidget(img, 1)
+            info = QLabel(stats_text)
+            info.setWordWrap(True)
+            info.setStyleSheet("font-family: monospace; padding: 6px;")
+            v.addWidget(info)
+            page.setLayout(v)
+            tabs.addTab(page, "Fehlerkarte")
+
+        close = QPushButton("Schließen")
+        close.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close)
+        lay = QVBoxLayout()
+        lay.addWidget(tabs, 1)
+        lay.addLayout(row)
+        self.setLayout(lay)
+
+    @staticmethod
+    def _copy(text: str, btn: QPushButton):
+        QApplication.clipboard().setText(text)
+        old = btn.text()
+        btn.setText("Kopiert ✓")
+        # revert the label after a moment (no-op if the dialog is gone)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(1200, lambda: btn.setText(old))
+
+
 class ResultView(QWidget):
     """Post-scan review page: traffic-light coverage/error map with the
     calibration summary. Green = good, used observations; red = bad."""
 
     backToScan = Signal()
     finishExport = Signal()
+    showDataset = Signal()
 
     def __init__(self):
         super().__init__()
@@ -642,25 +918,47 @@ class ResultView(QWidget):
         self.image.setAlignment(Qt.AlignCenter)
         self.image.setMinimumSize(640, 480)
         self.image.setStyleSheet("background-color: #101014;")
+        self.verdict = QLabel("")
+        self.verdict.setAlignment(Qt.AlignHCenter)
+        self.verdict.setStyleSheet("font-size:16px; font-weight:bold; padding:6px;")
         self.summary = QLabel("")
-        self.summary.setStyleSheet("font-family: monospace; padding: 6px;")
+        self.summary.setStyleSheet("font-family: monospace; padding: 2px 6px;")
         self.summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.btn_back = QPushButton("Back to Scan")
-        self.btn_export = QPushButton("Finish and Create Calibrationfile")
+        self.details = QLabel("")
+        self.details.setWordWrap(True)
+        self.details.setStyleSheet("padding: 2px 6px;")
+        self.details.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.btn_back = QPushButton("Zurück zum Scannen")
+        self.btn_back.setToolTip(
+            "Zurück zum Scannen und ein neuer Abtast-Durchgang, um schwache "
+            "Bereiche nachzulegen. Alle bisherigen Aufnahmen bleiben erhalten.")
+        self.btn_show = QPushButton("Kalibrierergebnis anzeigen")
+        self.btn_show.setToolTip("Zeigt den Kalibrier-Datensatz als JSON und "
+                                 "XML zum Kopieren.")
+        self.btn_export = QPushButton("Kalibrierdatei erstellen")
         self.btn_back.clicked.connect(self.backToScan.emit)
+        self.btn_show.clicked.connect(self.showDataset.emit)
         self.btn_export.clicked.connect(self.finishExport.emit)
+        for _b, _bg in ((self.btn_back, "#2d6cdf"), (self.btn_show, "#2e9e4f"),
+                        (self.btn_export, "#2e9e4f")):
+            _b.setStyleSheet(f"QPushButton{{font-weight:bold;padding:10px;"
+                             f"background:{_bg};color:white;border-radius:4px;}}")
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.btn_back)
         buttons.addStretch(1)
+        buttons.addWidget(self.btn_show)
         buttons.addWidget(self.btn_export)
         lay = QVBoxLayout()
         lay.addWidget(self.image, 1)
+        lay.addWidget(self.verdict)
         lay.addWidget(self.summary)
+        lay.addWidget(self.details)
         lay.addLayout(buttons)
         self.setLayout(lay)
 
-    def set_result(self, result, ocam_result, bgr_map: np.ndarray):
+    def set_result(self, result, ocam_result, bgr_map: np.ndarray, *,
+                   coverage=None, tilt=None, target_coverage: float = 0.85):
         h, w = bgr_map.shape[:2]
         qimg = QImage(bgr_map.data, w, h, bgr_map.strides[0],
                       QImage.Format_BGR888)
@@ -674,11 +972,17 @@ class ResultView(QWidget):
         model = "OCam (Fisheye)" if ocam_result is not None else "Pinhole"
         self.summary.setText(
             f"Modell: {model}   Views: {result.n_views}   "
-            f"Punkte: {len(errs)}  (gut <=1px: {good}, schlecht >2px: {bad})\n"
+            f"Punkte: {len(errs)}  (gut ≤1px: {good}, schlecht >2px: {bad})\n"
             f"fx={result.fx:.2f}  fy={result.fy:.2f}  "
             f"cx={result.cx:.2f}  cy={result.cy:.2f}   RMS={rms:.3f} px\n"
-            f"Grün = gute, verwendete Punkte - Rot = schlechte Punkte. "
-            f"Dünn besetzte/rote Zonen? -> Back to Scan und dort nachscannen.")
+            f"Grün = gute, verwendete Punkte · Rot = schlechte Punkte.")
+        verdict, color, details = assess_calibration(
+            result, ocam_result, coverage=coverage, tilt=tilt,
+            target_coverage=target_coverage)
+        self.verdict.setText(verdict)
+        self.verdict.setStyleSheet(
+            f"font-size:16px; font-weight:bold; padding:6px; color:{color};")
+        self.details.setText(details)
 
     def _rescale(self):
         if self._pixmap is not None:
@@ -725,6 +1029,8 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: CaptureWorker | None = None
         self._session: CalibrationSession | None = None
+        #: ROI chosen during preview, applied to the session on Start
+        self._pending_roi: Roi | None = None
         self._source: FrameSource | None = None
         self._capture_running = False
         self._last_stats_update = 0.0
@@ -739,6 +1045,7 @@ class MainWindow(QMainWindow):
         self.view = LiveView()
         self.result_view = ResultView()
         self.result_view.backToScan.connect(self.back_to_scan)
+        self.result_view.showDataset.connect(self.show_dataset)
         self.result_view.finishExport.connect(self.export_calibration)
         self.stats = QLabel("-")
         self.stats.setStyleSheet("font-family: monospace; padding: 6px;")
@@ -756,6 +1063,10 @@ class MainWindow(QMainWindow):
         self.lbl_camera_status = QLabel("")
         self.lbl_camera_status.setWordWrap(True)
         self.btn_refresh_cameras = QPushButton("Kameras aktualisieren")
+        self.btn_preview = QPushButton("Vorschau")
+        self.btn_preview.setToolTip("Zeigt das Livebild der gewählten Kamera "
+                                    "ohne Messung – zum Ausrichten/Prüfen von "
+                                    "Bild und Belichtung. Mit „Stop“ beenden.")
         self.chk_reset_defaults = QCheckBox("Auf Kamera-Defaults zuruecksetzen")
         self.chk_reset_defaults.setChecked(True)
         self.chk_custom_exposure = QCheckBox("Belichtung manuell setzen")
@@ -769,20 +1080,41 @@ class MainWindow(QMainWindow):
         self.btn_start = QPushButton("Start")
         self.btn_stop = QPushButton("Stop && Kamera freigeben")
         self.btn_stop.setEnabled(False)
-        self.btn_finish = QPushButton("Ergebnis berechnen")
+        # densification: re-open novelty so already-covered - especially
+        # thinly-covered - areas can be scanned over again for more keyframes
+        self.btn_densify = QPushButton("Zusätzlich drüberscannen")
+        self.btn_densify.setToolTip(
+            "Legt eine neue Abtast-Schicht an: bereits erfasste Bereiche "
+            "zählen wieder als neu, sodass du dünn besetzte Zonen gezielt "
+            "verdichten kannst. Die bisherigen Aufnahmen bleiben erhalten.")
+        self.btn_densify.setEnabled(False)
+        self.btn_densify.setStyleSheet(
+            "QPushButton{font-weight:bold;padding:10px;background:#2d6cdf;"
+            "color:white;border-radius:4px;}"
+            "QPushButton:disabled{background:#33384a;color:#8890a0;}")
+        self.btn_finish = QPushButton("Abschließen zur Berechnung")
+        self.btn_finish.setToolTip(
+            "Beendet das Scannen und berechnet die Kalibrierung aus den "
+            "gesammelten Aufnahmen.")
         self.btn_finish.setEnabled(False)
+        self.btn_finish.setStyleSheet(
+            "QPushButton{font-weight:bold;padding:10px;background:#2e9e4f;"
+            "color:white;border-radius:4px;}"
+            "QPushButton:disabled{background:#33384a;color:#8890a0;}")
         self.btn_cancel = QPushButton("Abbrechen")
         self.btn_cancel.setEnabled(False)
         self.cmb_model.currentIndexChanged.connect(self._on_model_changed)
         self.cmb_target.currentIndexChanged.connect(self._on_target_changed)
         self.cmb_camera.currentIndexChanged.connect(self._on_camera_changed)
         self.btn_refresh_cameras.clicked.connect(self.refresh_cameras)
+        self.btn_preview.clicked.connect(self.preview)
         self.chk_custom_exposure.toggled.connect(self.spn_exposure_ms.setEnabled)
         self.chk_custom_exposure.toggled.connect(lambda _checked: self._update_camera_status())
         self.chk_reset_defaults.toggled.connect(lambda _checked: self._update_camera_status())
         self.spn_exposure_ms.valueChanged.connect(lambda _value: self._update_camera_status())
         self.btn_start.clicked.connect(self.start)
         self.btn_stop.clicked.connect(self.stop)
+        self.btn_densify.clicked.connect(self.densify)
         self.btn_finish.clicked.connect(self.finish)
         self.btn_cancel.clicked.connect(self.cancel_solve)
         self.chk_roi.toggled.connect(self.view.set_roi_edit)
@@ -794,20 +1126,26 @@ class MainWindow(QMainWindow):
         side.addWidget(self.cmb_model)
         side.addWidget(self.lbl_target)
         side.addWidget(self.cmb_target)
-        side.addWidget(self.chk_roi)
         if self._camera_mode:
             side.addWidget(self.lbl_camera)
             side.addWidget(self.cmb_camera)
-            side.addWidget(self.btn_refresh_cameras)
+            cam_row = QHBoxLayout()
+            cam_row.addWidget(self.btn_refresh_cameras)
+            cam_row.addWidget(self.btn_preview)
+            side.addLayout(cam_row)
+            side.addWidget(self.chk_roi)
             side.addWidget(self.chk_reset_defaults)
             side.addWidget(self.chk_custom_exposure)
             side.addWidget(self.spn_exposure_ms)
             side.addWidget(self.lbl_camera_status)
+        else:
+            side.addWidget(self.chk_roi)
         side.addWidget(self.stats)
         side.addStretch(1)
         side.addWidget(self.btn_start)
-        side.addWidget(self.btn_stop)
+        side.addWidget(self.btn_densify)
         side.addWidget(self.btn_finish)
+        side.addWidget(self.btn_stop)
         side.addWidget(self.btn_cancel)
         sidew = QWidget()
         sidew.setLayout(side)
@@ -828,6 +1166,54 @@ class MainWindow(QMainWindow):
             self.refresh_cameras()
 
     # ------------------------------------------------------------------
+    @Slot()
+    def preview(self):
+        """Show the selected camera's live stream without any measurement -
+        for framing/exposure checks. „Start" begins the real capture, „Stop"
+        releases the camera."""
+        self.stop()
+        self._stack.setCurrentIndex(0)
+        self._result = self._ocam_result = self._result_map = None
+        self._last_fb = None
+        self._session = None
+        if self._camera_mode and self.cmb_camera.count() == 0:
+            QMessageBox.warning(self, "Keine Kamera",
+                                "Es ist keine GigE/GenICam-Kamera ausgewaehlt.")
+            return
+        try:
+            self._source = self._make_source(self._selected_camera(),
+                                             self._source_options())
+            self._source.open()
+        except Exception as e:
+            QMessageBox.critical(self, "Fehler", str(e))
+            return
+        self.view.reset_overlay()
+        # allow ROI adjustment already during preview: seed a default ROI for
+        # the selected model and remember edits for the upcoming session
+        model = CameraModel(self._selected_model_value())
+        is_fish = model is CameraModel.FISHEYE
+        self._pending_roi = Roi.default(self._source.image_size, model)
+        self.view.set_roi(self._pending_roi, square=is_fish, elliptical=is_fish)
+        self.chk_roi.setEnabled(True)
+        self._worker = CaptureWorker(self._source, None)  # None -> preview only
+        self._thread = QThread()
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.framePreview.connect(self._on_preview)
+        self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._on_capture_finished)
+        self._thread.start()
+        self._capture_running = True
+        self._last_stats_update = 0.0
+        self.btn_stop.setEnabled(True)
+        self.btn_densify.setEnabled(False)
+        self.btn_finish.setEnabled(False)
+        self._set_camera_controls_enabled(False)
+        self.stats.setText("Vorschau – Livebild, keine Messung.\n"
+                           "Start beginnt die Kalibrier-Aufnahme, "
+                           "Stop gibt die Kamera frei.")
+
     @Slot()
     def start(self):
         self.stop()
@@ -851,6 +1237,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Fehler", str(e))
             return
+        # carry over an ROI adjusted during preview
+        if self._pending_roi is not None:
+            self._session.set_roi(self._pending_roi)
         self._worker = CaptureWorker(self._source, self._session)
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
@@ -870,13 +1259,29 @@ class MainWindow(QMainWindow):
         self.chk_roi.setEnabled(True)
         self.btn_start.setText("Neu starten")
         self.btn_stop.setEnabled(True)
+        self.btn_densify.setEnabled(True)
         self.btn_finish.setEnabled(True)
         self._set_camera_controls_enabled(False)
         self.cmb_model.setEnabled(False)
         self.cmb_target.setEnabled(False)
 
+    @Slot()
+    def densify(self):
+        """Start a new densification run on the live session (see
+        CalibrationSession.start_run): already-covered areas count as new
+        again, so scanning over thinly-covered zones adds more keyframes."""
+        if self._session is None:
+            return
+        self._session.start_run()
+        self.stats.setText(
+            "Neuer Abtast-Durchgang.\nFahr jetzt vor allem die dunkelroten "
+            "(dünn besetzten) Bereiche erneut ab - dort werden wieder "
+            "Aufnahmen angenommen.")
+
     @Slot(object)
     def _on_roi_changed(self, roi):
+        # remember it so a preview-time ROI carries over to the session
+        self._pending_roi = roi
         if self._session is not None:
             self._session.set_roi(roi)
 
@@ -893,6 +1298,7 @@ class MainWindow(QMainWindow):
         self._capture_running = False
         self.btn_start.setText("Start")
         self.btn_stop.setEnabled(False)
+        self.btn_densify.setEnabled(False)
         self.chk_roi.setChecked(False)
         self.chk_roi.setEnabled(False)
         self._set_camera_controls_enabled(True)
@@ -918,8 +1324,8 @@ class MainWindow(QMainWindow):
     def _on_frame(self, frame, fb: FrameFeedback, metrics: RuntimeMetrics):
         """A completed evaluation (still-capture) - update coverage/points."""
         try:
-            mask = self._session.coverage.mask() if self._session else None
-            self.view.update_frame(frame, fb, mask)
+            veil = self._session.coverage.veil_alpha() if self._session else None
+            self.view.update_frame(frame, fb, veil)
             self._last_fb = fb
             self._update_stats(fb, metrics)
         finally:
@@ -932,15 +1338,16 @@ class MainWindow(QMainWindow):
     def _on_preview(self, frame, tick, metrics: RuntimeMetrics):
         """Every camera frame at native fps - cheap overlay only."""
         try:
-            mask = self._session.coverage.mask() if self._session else None
-            self.view.update_preview(frame, tick, mask)
+            veil = self._session.coverage.veil_alpha() if self._session else None
+            self.view.update_preview(frame, tick, veil)
             fb = getattr(self, "_last_fb", None)
-            if fb is not None:
+            if fb is not None and tick is not None:
                 self._update_stats(fb, metrics, tick)
             elif time.perf_counter() - self._last_stats_update >= 0.25:
+                msg = tick.message if tick is not None else "Vorschau – Livebild (keine Messung)"
                 self.stats.setText(
                     f"Cap {metrics.capture_fps:4.1f} fps | UI {metrics.display_fps:4.1f} fps\n"
-                    f"{tick.message}")
+                    f"{msg}")
                 self._last_stats_update = time.perf_counter()
         finally:
             # Call directly from the UI thread: queued delivery back into the
@@ -954,9 +1361,11 @@ class MainWindow(QMainWindow):
         now = time.perf_counter()
         if now - self._last_stats_update < 0.25:
             return
+        outcome = ("aufgenommen ✓" if fb.keyframe
+                   else f"nicht aufgenommen – {REASON_TEXT.get(fb.reason, fb.reason)}")
         lines = [
             f"Status {fb.state.value} | Marker {len(fb.ids)} | KF {fb.n_keyframes}",
-            f"Letzter Frame: Punkte {len(fb.points)} | Keyframe {'JA' if fb.keyframe else 'nein'} | Grund: {fb.reason}",
+            f"Letzte Auswertung: {len(fb.points)} Punkte, {outcome}",
             f"Abd {fb.coverage*100:.0f}% | Winkel {fb.tilt_coverage*100:.0f}%",
             f"Laufz {metrics.elapsed_s:6.1f}s | Cap {metrics.capture_fps:4.1f} fps | UI {metrics.display_fps:4.1f} fps",
             f"Frames {metrics.captured_frames}/{metrics.displayed_frames} | Drops {metrics.dropped_previews}",
@@ -1077,6 +1486,14 @@ class MainWindow(QMainWindow):
             return self._cameras[index]
         return None
 
+    def _camera_identifier(self) -> str:
+        """Identifier used in exported filenames and the XML camera id -
+        the selected camera's serial number when known, so results are
+        traceable to the physical camera."""
+        cam = self._selected_camera() or {}
+        return (cam.get("serial_number") or self._initial_camera_serial
+                or self._camera_id or "camera")
+
     def _selected_target_spec(self) -> str:
         data = self.cmb_target.currentData()
         if isinstance(data, str) and data:
@@ -1128,6 +1545,7 @@ class MainWindow(QMainWindow):
             return
         self.cmb_camera.setEnabled(enabled)
         self.btn_refresh_cameras.setEnabled(enabled)
+        self.btn_preview.setEnabled(enabled)
         self.chk_reset_defaults.setEnabled(enabled)
         self.chk_custom_exposure.setEnabled(enabled)
         self.spn_exposure_ms.setEnabled(enabled and self.chk_custom_exposure.isChecked())
@@ -1162,6 +1580,7 @@ class MainWindow(QMainWindow):
         # while and used to freeze the GUI here. Progress and a cancel
         # action are shown as an overlay on the frozen camera image.
         self.btn_finish.setEnabled(False)
+        self.btn_densify.setEnabled(False)
         self.btn_start.setEnabled(False)
         self.btn_cancel.setText("Abbrechen")
         self.btn_cancel.setEnabled(True)
@@ -1207,12 +1626,21 @@ class MainWindow(QMainWindow):
         self._result = result
         self._ocam_result = ocam_result
         self._result_map = bgr_map
-        self.result_view.set_result(result, ocam_result, bgr_map)
+        cov = tilt = None
+        target_cov = 0.85
+        if self._session is not None:
+            cov = self._session.coverage.fraction
+            tilt = self._session.coverage.tilt_fraction
+            target_cov = self._session._target_coverage()
+        self.result_view.set_result(result, ocam_result, bgr_map,
+                                    coverage=cov, tilt=tilt,
+                                    target_coverage=target_cov)
         self._stack.setCurrentIndex(1)
         self.stats.setText(
-            "Ergebnis prüfen:\nGrün = gute Punkte, Rot = schlechte.\n\n"
-            "Back to Scan  -> weiter scannen und verbessern\n"
-            "Finish and Create Calibrationfile -> abschließen")
+            "Ergebnis prüfen. Die Bewertung unter dem Bild sagt, ob es reicht "
+            "oder was du nachscannen solltest.\n\n"
+            "„Zurück zum Scannen“ → schwache Bereiche nachlegen\n"
+            "„Kalibrierdatei erstellen“ → abschließen")
 
     @Slot()
     def _on_solve_cancelled(self):
@@ -1233,7 +1661,9 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(0)
         if not self._session:
             return
-        self._session.resume()
+        # start_run (not resume): coming back after a result, re-open coverage
+        # novelty so the user can immediately scan more into thin/empty areas
+        self._session.start_run()
         selected_camera = self._selected_camera()
         try:
             self._source = self._make_source(selected_camera, self._source_options())
@@ -1259,18 +1689,35 @@ class MainWindow(QMainWindow):
             elliptical=self._session.cfg.model is CameraModel.FISHEYE)
         self.chk_roi.setEnabled(True)
         self.btn_stop.setEnabled(True)
+        self.btn_densify.setEnabled(True)
         self.btn_finish.setEnabled(True)
         self._set_camera_controls_enabled(False)
         self.cmb_model.setEnabled(False)
         self.cmb_target.setEnabled(False)
 
     @Slot()
+    def show_dataset(self):
+        if self._result is None:
+            return
+        try:
+            json_str, xml_str = calibration_strings(
+                self._result, self._ocam_result, self._camera_identifier(),
+                self._pixel_size)
+        except Exception as e:
+            QMessageBox.critical(self, "Fehler", str(e))
+            return
+        stats = error_stats_text(self._result, self._ocam_result)
+        ResultDatasetDialog(xml_str, json_str, self._result_map, stats,
+                            parent=self).exec()
+
+    @Slot()
     def export_calibration(self):
         if self._result is None:
             return
         from pathlib import Path
+        ident = self._camera_identifier()
         suffix = "ocam" if self._ocam_result is not None else "ocv"
-        default = str(Path.home() / "Documents" / f"{self._camera_id}-{suffix}.xml")
+        default = str(Path.home() / "Documents" / f"{ident}-{suffix}.xml")
         xml_path, _ = QFileDialog.getSaveFileName(
             self, "Kalibrierung exportieren", default, "XML-Datei (*.xml)")
         if not xml_path:
@@ -1278,7 +1725,7 @@ class MainWindow(QMainWindow):
         try:
             written = write_calibration_files(
                 self._result, self._ocam_result, xml_path,
-                self._camera_id, self._pixel_size, self._result_map)
+                ident, self._pixel_size, self._result_map)
         except Exception as e:
             QMessageBox.critical(self, "Export fehlgeschlagen", str(e))
             return

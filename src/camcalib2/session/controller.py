@@ -65,7 +65,11 @@ class SessionConfig:
     fisheye_target_coverage: float = 0.70
     target_tilt_fraction: float = 0.5
     min_keyframes: int = 12
-    max_keyframes: int = 80
+    #: soft cap on stored keyframes. It only limits *densification*
+    #: (re-covering already-covered cells); a frame that reaches a
+    #: still-empty cell is always accepted (see process()), so the cap never
+    #: blocks completing coverage.
+    max_keyframes: int = 150
     #: recalibrate every N new keyframes
     recalib_every: int = 4
     #: skip the background recalibration above this many views for
@@ -88,6 +92,11 @@ class SessionConfig:
     #: median PnP residual (px) above which a keyframe detection is
     #: rejected as toxic (mis-indexed grid, gross mismatch)
     keyframe_gate_px: float = 8.0
+    #: same gate for fisheye - looser, because a correct board near the rim
+    #: legitimately reprojects with a larger error under the KB model (its
+    #: least accurate region); too tight a gate rejects exactly the rim
+    #: views needed to complete coverage. The OCam export refines the rim.
+    fisheye_keyframe_gate_px: float = 20.0
 
 
 @dataclass
@@ -106,6 +115,25 @@ class FrameFeedback:
     result: CalibrationResult | None
     progress: float  # 0..1 combined progress for the UI ring
     capture_state: CaptureState | None = None
+
+
+#: plain-language explanation for each FrameFeedback.reason code, for UI
+#: feedback ("why was this frame (not) captured"). ASCII-only so the OpenCV
+#: diagnostic overlay can render it too.
+REASON_TEXT = {
+    "no_target": "kein Board im Bild",
+    "too_few_points": "zu wenige Punkte erkannt",
+    "too_soon": "zu schnell hintereinander",
+    "blurry": "unscharf / zu viel Bewegung",
+    "static": "nichts Neues - Bereich schon abgedeckt",
+    "partial_static": "Teilansicht ohne neuen Bereich",
+    "detection_rejected": "Gitter passt nicht zum Modell - verworfen",
+    "max_keyframes": "Aufnahme-Budget voll",
+    "precise_detect_failed": "Feindetektion fehlgeschlagen",
+    "new_coverage": "neuer Bereich",
+    "motion": "Bewegung",
+    "new_tilt": "neuer Blickwinkel",
+}
 
 
 class CalibrationSession:
@@ -395,7 +423,11 @@ class CalibrationSession:
                     if model_result is not None and not self._view_sane(
                             p_ids, p_pts, p_obj, model_result):
                         keyframe, reason = False, "detection_rejected"
-                    elif len(self.views) >= self.cfg.max_keyframes:
+                    elif (len(self.views) >= self.cfg.max_keyframes
+                            and self.coverage.new_cells_global(p_pts) == 0):
+                        # budget full - but only block redundant density
+                        # frames; one that reaches a still-empty cell is what
+                        # we actually want, so let it through (bounded).
                         keyframe, reason = False, "max_keyframes"
                     else:
                         if (self.cfg.model is CameraModel.PINHOLE
@@ -440,7 +472,10 @@ class CalibrationSession:
             err = err[np.isfinite(err)]
             if err.size < 6:
                 return True
-            return float(np.median(err)) < self.cfg.keyframe_gate_px
+            gate = (self.cfg.fisheye_keyframe_gate_px
+                    if self.cfg.model is CameraModel.FISHEYE
+                    else self.cfg.keyframe_gate_px)
+            return float(np.median(err)) < gate
         except (cv2.error, ValueError):
             return True
 
@@ -563,5 +598,15 @@ class CalibrationSession:
     def resume(self) -> None:
         """Continue scanning after a finish() - keyframes, coverage and
         the current calibration are kept, new keyframes improve them."""
+        if self.state in (SessionState.FINISHED, SessionState.CONVERGED):
+            self.state = SessionState.SCANNING
+
+    def start_run(self) -> None:
+        """Start a new densification run: keep all keyframes/coverage but
+        measure coverage novelty afresh, so re-scanning already-covered -
+        especially the still-sparse - areas is accepted again and thickens
+        the point density there. Resumes scanning if the session had
+        converged/finished. See :meth:`CoverageMap.start_run`."""
+        self.coverage.start_run()
         if self.state in (SessionState.FINISHED, SessionState.CONVERGED):
             self.state = SessionState.SCANNING

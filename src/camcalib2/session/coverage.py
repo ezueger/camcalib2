@@ -123,7 +123,11 @@ def cells_in_roi(image_size: tuple[int, int], grid: tuple[int, int],
 class CoverageMap:
     image_size: tuple[int, int]  # (w, h)
     grid: tuple[int, int] = (16, 12)  # (cols, rows)
+    #: cumulative keyframe hits per cell over all runs (density)
     counts: np.ndarray = field(init=False)
+    #: hits per cell within the *current* densification run (novelty is
+    #: measured against this, so a new run re-opens already-covered cells)
+    run_counts: np.ndarray = field(init=False)
     #: tilt direction histogram: 8 directions + 1 frontal bin
     tilt_bins: np.ndarray = field(init=False)
     roi: Roi | None = None
@@ -134,9 +138,22 @@ class CoverageMap:
     def __post_init__(self):
         cols, rows = self.grid
         self.counts = np.zeros((rows, cols), dtype=np.int32)
+        self.run_counts = np.zeros((rows, cols), dtype=np.int32)
         self.tilt_bins = np.zeros(9, dtype=np.int32)
         self._roi_cells = cells_in_roi(self.image_size, self.grid, self.roi,
                                        self.elliptical)
+
+    # ------------------------------------------------------------------
+    def start_run(self) -> None:
+        """Begin a new densification run.
+
+        Coverage novelty is measured afresh (``run_counts`` reset to zero),
+        so re-scanning already-covered cells counts as new again and
+        keyframes flow until the reachable region is covered *once more* -
+        typically another ~10-20 keyframes. The cumulative ``counts`` (and
+        thus the veil's density shading) are kept, so the user can see which
+        areas are still thin and thicken them run by run."""
+        self.run_counts[:] = 0
 
     # ------------------------------------------------------------------
     def set_roi(self, roi: Roi | None) -> None:
@@ -163,19 +180,38 @@ class CoverageMap:
         return cells[self._roi_cells.ravel()[cells]]
 
     def add_points(self, points: np.ndarray) -> int:
-        """Mark cells covered; returns the number of newly covered cells."""
+        """Record a keyframe's cells; returns how many were new *this run*.
+
+        Bumps both the cumulative ``counts`` (density) and the per-run
+        ``run_counts`` (novelty)."""
         if len(points) == 0:
             return 0
         cells = self._eligible(np.unique(self._cells(points)))
         if cells.size == 0:
             return 0
         flat = self.counts.ravel()
-        fresh = int((flat[cells] == 0).sum())
+        rflat = self.run_counts.ravel()
+        fresh = int((rflat[cells] == 0).sum())
         flat[cells] += 1
+        rflat[cells] += 1
         return fresh
 
     def new_cells(self, points: np.ndarray) -> int:
-        """How many still-uncovered in-ROI cells the points would hit."""
+        """How many in-ROI cells the points would newly cover *this run*
+        (cells not yet hit since the last :meth:`start_run`)."""
+        if len(points) == 0:
+            return 0
+        cells = self._eligible(np.unique(self._cells(points)))
+        if cells.size == 0:
+            return 0
+        return int((self.run_counts.ravel()[cells] == 0).sum())
+
+    def new_cells_global(self, points: np.ndarray) -> int:
+        """In-ROI cells the points would cover that have *never* been
+        covered in any run (cumulative ``counts == 0``). Bounded by the cell
+        count - used to let coverage-completing frames through even when the
+        keyframe budget is otherwise full, so still-empty areas are never
+        blocked."""
         if len(points) == 0:
             return 0
         cells = self._eligible(np.unique(self._cells(points)))
@@ -217,3 +253,16 @@ class CoverageMap:
     def mask(self) -> np.ndarray:
         """Boolean (rows, cols) array of covered cells."""
         return self.counts > 0
+
+    def veil_alpha(self, target_count: int = 3) -> np.ndarray:
+        """Per-cell red-veil opacity in ``[0, 1]`` for the scan overlay.
+
+        A cell covered in the current run is clear (rubbed free). Otherwise
+        it carries a light base layer plus extra opacity the further its
+        cumulative ``counts`` sit below ``target_count`` - so a fresh run
+        re-tints everything lightly, while globally sparse cells stay darker
+        and can be targeted for another pass. Cells outside the eligible
+        region are 0 (drawn as excluded elsewhere)."""
+        deficit = np.clip(target_count - self.counts, 0, target_count) / float(target_count)
+        alpha = np.where(self.run_counts == 0, 0.25 + 0.75 * deficit, 0.0)
+        return np.where(self._roi_cells, alpha, 0.0)

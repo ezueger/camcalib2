@@ -17,7 +17,14 @@ detection/keyframe behaviour can be watched and analysed:
 It also writes an annotated snapshot (``live_snapshot.png`` next to this
 file) every few seconds - handy for inspecting the coverage veil offline.
 
-Keys in the preview window:  q = quit,  r = reset session.
+The veil shades by cumulative density: a fresh run re-tints everything
+lightly and you "rub it free" as you cover cells this run, while globally
+sparse cells stay darker so you can target them for another pass.
+
+Keys in the preview window:
+    q = quit
+    n = new densification run (keep keyframes/coverage, re-open novelty)
+    r = full reset (new session from scratch)
 
 Examples::
 
@@ -43,6 +50,23 @@ from camcalib2.cli import parse_target
 from camcalib2.session import CalibrationSession, SessionConfig
 
 SNAPSHOT = os.path.join(os.path.dirname(__file__), "live_snapshot.png")
+
+# plain-language explanation of each accept/reject reason code (ASCII only -
+# the OpenCV Hershey font can't render umlauts)
+REASON_DE = {
+    "no_target": "kein Board erkannt (0 Punkte)",
+    "too_few_points": "zu wenige Punkte",
+    "too_soon": "zu schnell hintereinander",
+    "blurry": "unscharf / zu viel Bewegung",
+    "static": "nichts Neues (Zelle schon bedeckt)",
+    "partial_static": "Teil-Ansicht ohne neue Flaeche",
+    "detection_rejected": "Gitter passt nicht zum Modell (PnP-Gate)",
+    "max_keyframes": "Budget voll (nur Verdichtung blockiert)",
+    "precise_detect_failed": "Feindetektion fehlgeschlagen",
+    "new_coverage": "neue Flaeche",
+    "motion": "Bewegung",
+    "new_tilt": "neuer Winkel",
+}
 
 
 def log(msg: str) -> None:
@@ -79,6 +103,7 @@ def main() -> int:
     scale = args.preview_width / w
     reasons = Counter()
     kf_total = kf_partial = 0
+    run_no = 1
     last_reason = None
     last_phase = None
     last_hb = 0.0
@@ -132,34 +157,35 @@ def main() -> int:
                     f"cov={fb.coverage*100:4.0f}% tilt={fb.tilt_coverage*100:4.0f}% "
                     f"kf={fb.n_keyframes} (partial={kf_partial})"
                     + (f" rms={fb.rms:.3f}" if fb.rms else "")
-                    + f"  state={fb.state.value}")
+                    + f"  state={fb.state.value}  last={fb.reason}")
                 last_hb = now
 
             # --- preview ------------------------------------------------
             vis = cv2.cvtColor(cv2.resize(frame, None, fx=scale, fy=scale),
                                cv2.COLOR_GRAY2BGR)
-            # coverage veil: uncovered eligible cells -> light red (for
-            # fisheye the eligible region is the inscribed image circle)
-            mask = session.coverage.mask()
-            rows, cols = mask.shape
-            roi_cells = session.coverage.roi_cell_mask()
+            # coverage veil: opacity by density - clear where covered this
+            # run, darker red the sparser a cell is overall (fisheye: only
+            # inside the inscribed image circle)
+            alpha = session.coverage.veil_alpha()
+            rows, cols = alpha.shape
+            red = np.array([40, 40, 200], np.float32)  # BGR
             cw, ch = vis.shape[1] / cols, vis.shape[0] / rows
             for r in range(rows):
                 for c in range(cols):
-                    if roi_cells[r, c] and not mask[r, c]:
+                    a = float(alpha[r, c])
+                    if a > 0.01:
                         x0, y0 = int(c * cw), int(r * ch)
                         sub = vis[y0:y0 + int(ch) + 1, x0:x0 + int(cw) + 1]
-                        sub[:] = (0.7 * sub + 0.3 * np.array([40, 40, 200])).astype(np.uint8)
+                        sub[:] = ((1.0 - a) * sub + a * red).astype(np.uint8)
             # detected points: green if this frame is a keyframe, else blue
             col = (80, 255, 80) if fb.keyframe else (255, 200, 90)
             for x, y in fb.points:
                 cv2.circle(vis, (int(x * scale), int(y * scale)), 4, col, 1, cv2.LINE_AA)
             hud = [
-                f"{phase}  floor={floor}  pts={n}",
+                f"{phase}  run={run_no}  floor={floor}  pts={n}",
                 f"cov={fb.coverage*100:.0f}%  tilt={fb.tilt_coverage*100:.0f}%  "
                 f"kf={fb.n_keyframes} (partial={kf_partial})"
                 + (f"  rms={fb.rms:.3f}" if fb.rms else ""),
-                f"{'KEYFRAME '+fb.reason if fb.keyframe else 'reject '+fb.reason}",
             ]
             for i, line in enumerate(hud):
                 y = 22 + i * 22
@@ -167,6 +193,18 @@ def main() -> int:
                             0.6, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(vis, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
                             0.6, (255, 255, 255), 1, cv2.LINE_AA)
+            # prominent accept/reject banner (bottom): green keyframe / red
+            # rejection, always with the reason so it's clear why
+            if fb.keyframe:
+                banner, bcol = f"KEYFRAME #{fb.n_keyframes}  ({fb.reason})", (80, 255, 80)
+            else:
+                txt = REASON_DE.get(fb.reason, fb.reason)
+                banner, bcol = f"REJECT: {fb.reason} - {txt}", (60, 60, 255)  # BGR red
+            by = vis.shape[0] - 16
+            cv2.putText(vis, banner, (10, by), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, (0, 0, 0), 5, cv2.LINE_AA)
+            cv2.putText(vis, banner, (10, by), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, bcol, 2, cv2.LINE_AA)
             cv2.imshow(win, vis)
             if now - last_snap > 3.0:
                 cv2.imwrite(SNAPSHOT, vis)
@@ -175,10 +213,16 @@ def main() -> int:
             k = cv2.waitKey(1) & 0xFF
             if k == ord("q"):
                 break
+            if k == ord("n"):
+                session.start_run()
+                run_no += 1
+                log(f"=== new run #{run_no} (densify) - keyframes so far="
+                    f"{fb.n_keyframes}, cov={fb.coverage*100:.0f}% ===")
             if k == ord("r"):
                 session = CalibrationSession(target, (w, h), cfg)
                 reasons.clear()
                 kf_total = kf_partial = 0
+                run_no = 1
                 last_reason = last_phase = None
                 log("=== session reset ===")
     finally:

@@ -31,6 +31,30 @@ def test_coverage_fraction():
     assert cm.add_points(pts) == 0  # already covered
 
 
+def test_coverage_densification_runs():
+    """A new run re-opens coverage novelty (so re-scanning adds keyframes
+    again) while keeping the cumulative per-cell density."""
+    cm = CoverageMap((400, 400), grid=(4, 4))
+    pt = np.array([[50.0, 50.0]])  # one cell
+    assert cm.new_cells(pt) == 1
+    assert cm.add_points(pt) == 1
+    assert cm.new_cells(pt) == 0          # already covered THIS run
+    assert cm.fraction == 1 / 16
+    # veil: covered-this-run cell is clear, an untouched cell is red
+    veil = cm.veil_alpha()
+    assert veil[0, 0] == 0.0 and veil[3, 3] > 0.0
+
+    cm.start_run()
+    assert cm.new_cells(pt) == 1          # fresh run -> countable again
+    assert cm.add_points(pt) == 1
+    assert cm.counts[0, 0] == 2           # cumulative density kept
+    assert cm.run_counts[0, 0] == 1       # but per-run reset
+    # global novelty ignores runs: an already-covered cell never counts,
+    # a never-touched one still does (used to bypass the keyframe cap)
+    assert cm.new_cells_global(pt) == 0
+    assert cm.new_cells_global(np.array([[350.0, 350.0]])) == 1
+
+
 def test_coverage_tilt_bins():
     cm = CoverageMap((100, 100))
     cm.add_tilt(None, 0.0)

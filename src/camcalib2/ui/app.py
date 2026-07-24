@@ -226,8 +226,8 @@ def main(argv=None) -> int:
                          ),
                      },
                      initial_target_spec=initial_target_spec)
-    win.resize(1280, 800)
-    win.show()
+    win.resize(1280, 800)  # restore size when the user un-maximizes
+    win.showMaximized()
     return app.exec()
 
 

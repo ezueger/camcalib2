@@ -98,13 +98,30 @@ def test_capture_worker_runtime_metrics_count_dropped_previews():
     assert metrics.displayed_frames == 0
 
 
+def test_assess_calibration_verdict_and_tilt_warning():
+    from types import SimpleNamespace
+    from camcalib2.ui.main_window import assess_calibration
+
+    res = SimpleNamespace(rms=0.3, per_point_errors=[np.zeros(50)])
+    # good coverage + plenty of tilt -> directly usable
+    verdict, _c, details = assess_calibration(
+        res, None, coverage=0.9, tilt=0.75, target_coverage=0.85)
+    assert verdict.startswith("Sehr gut")
+
+    # too little tilt -> not "sehr gut", warns and gives a tilt tip
+    verdict, _c, details = assess_calibration(
+        res, None, coverage=0.9, tilt=0.12, target_coverage=0.85)
+    assert not verdict.startswith("Sehr gut")
+    assert "gekippt" in details.lower() and "kippe" in details.lower()
+
+
 def test_main_window_on_frame_releases_preview_directly():
     app = QApplication.instance() or QApplication([])
 
     class _Coverage:
         @staticmethod
-        def mask():
-            return np.zeros((2, 2), dtype=bool)
+        def veil_alpha():
+            return np.zeros((2, 2), dtype=float)
 
     class _Session:
         coverage = _Coverage()
