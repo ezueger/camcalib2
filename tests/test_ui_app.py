@@ -3,9 +3,12 @@ import time
 import numpy as np
 import pytest
 from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QStyleOptionViewItem
 
 from camcalib2.session import FrameFeedback
 from camcalib2.session import SessionState
+from camcalib2.ui.main_window import _ROLE_CAMERA_SUBTITLE
+from camcalib2.ui.main_window import _ROLE_CAMERA_TITLE
 from camcalib2.ui.main_window import CaptureWorker
 from camcalib2.ui.main_window import MainWindow
 from camcalib2.ui.main_window import RuntimeMetrics
@@ -156,5 +159,51 @@ def test_main_window_on_frame_releases_preview_directly():
     win._on_frame(np.zeros((4, 4), dtype=np.uint8), fb, RuntimeMetrics())
 
     assert win._worker.calls == 1
+    win.close()
+    app.processEvents()
+
+
+def test_camera_dropdown_lines_show_type_and_serial():
+    camera = {
+        "vendor": "Daheng Imaging",
+        "model": "MER2-1220-32U3M",
+        "serial_number": "FBK25040148",
+        "tl_type": "GEV",
+        "ip_address": "10.0.0.9",
+    }
+    assert MainWindow._camera_title(camera, 1) == "[2] Daheng Imaging MER2-1220-32U3M"
+    assert MainWindow._camera_subtitle(camera) == "S/N FBK25040148  ·  GEV  ·  10.0.0.9"
+
+
+def test_camera_dropdown_subtitle_marks_missing_serial():
+    assert MainWindow._camera_subtitle({"model": "acA1920"}) == "S/N ?"
+
+
+def test_camera_dropdown_items_carry_both_lines():
+    app = QApplication.instance() or QApplication([])
+    cameras = [
+        {"vendor": "Daheng Imaging", "model": "MER2-503-23GM-P",
+         "serial_number": "FBF24070661", "tl_type": "GEV"},
+        {"vendor": "Daheng Imaging", "model": "MER2-503-23GM-P",
+         "serial_number": "FBK25040148", "tl_type": "GEV"},
+    ]
+    win = MainWindow(lambda *_a, **_k: None, lambda *_a, **_k: None,
+                     camera_mode=True, list_cameras=lambda: cameras)
+    win.refresh_cameras()
+
+    assert win.cmb_camera.count() == 2
+    # identical models - the serial is what tells them apart
+    titles = [win.cmb_camera.itemData(i, _ROLE_CAMERA_TITLE) for i in range(2)]
+    subtitles = [win.cmb_camera.itemData(i, _ROLE_CAMERA_SUBTITLE) for i in range(2)]
+    assert titles[0] == titles[1].replace("[2]", "[1]")
+    assert "FBF24070661" in subtitles[0] and "FBK25040148" in subtitles[1]
+
+    # the delegate must be able to render both lines
+    delegate = win.cmb_camera.itemDelegate()
+    option = QStyleOptionViewItem()
+    option.initFrom(win.cmb_camera.view())
+    hint = delegate.sizeHint(option, win.cmb_camera.model().index(0, 0))
+    assert hint.height() >= option.fontMetrics.height() * 2
+
     win.close()
     app.processEvents()

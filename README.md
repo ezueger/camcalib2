@@ -90,6 +90,12 @@ camcalib2 --camera --serial FBK25040148 --target dots --model pinhole \
           --camera-id FBK25040148 --pixel-size 0.0024
 ```
 
+Mehrere angeschlossene Kameras sind kein Problem: das Kamera-Dropdown
+listet alle gefundenen Geraete zweizeilig auf — Hersteller/Modell oben,
+Seriennummer (plus Transport/IP) darunter, sodass sich auch baugleiche
+Kameras unterscheiden lassen. `--serial` ist damit optional und dient nur
+noch als Vorauswahl.
+
 Simulation aus Bilderordner:
 
 ```bash

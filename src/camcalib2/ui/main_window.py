@@ -6,15 +6,17 @@ import threading
 import time
 from dataclasses import dataclass
 import numpy as np
-from PySide6.QtCore import (QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread,
-                            Signal, Slot)
+from PySide6.QtCore import (QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt,
+                            QThread, Signal, Slot)
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter,
-                           QPainterPath, QPen, QPixmap, QPolygonF)
+                           QPainterPath, QPalette, QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel,
-                               QMainWindow, QMessageBox, QPlainTextEdit,
-                               QPushButton, QStackedWidget, QTabWidget,
-                               QVBoxLayout, QWidget)
+                               QListView, QMainWindow, QMessageBox,
+                               QPlainTextEdit, QPushButton, QStackedWidget,
+                               QStyle, QStyledItemDelegate,
+                               QStyleOptionViewItem, QTabWidget, QVBoxLayout,
+                               QWidget)
 
 from ..calibration import CameraModel
 from ..capture.source import FrameSource
@@ -994,6 +996,62 @@ class ResultView(QWidget):
         self._rescale()
 
 
+#: extra item data roles for the two-line camera entries
+_ROLE_CAMERA_TITLE = Qt.UserRole + 1     # line 1: vendor + model
+_ROLE_CAMERA_SUBTITLE = Qt.UserRole + 2  # line 2: serial number (+ network)
+
+
+class CameraItemDelegate(QStyledItemDelegate):
+    """Renders a camera on two lines so model *and* serial stay readable."""
+
+    def paint(self, painter, option, index):
+        title = index.data(_ROLE_CAMERA_TITLE)
+        if not title:  # entries without the extra roles render normally
+            super().paint(painter, option, index)
+            return
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""  # background/selection only - we draw the text ourselves
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
+        selected = bool(opt.state & QStyle.State_Selected)
+        role = QPalette.HighlightedText if selected else QPalette.Text
+        rect = opt.rect.adjusted(6, 3, -6, -3)
+
+        painter.save()
+        top = QFont(opt.font)
+        top.setBold(True)
+        painter.setFont(top)
+        painter.setPen(opt.palette.color(QPalette.Active, role))
+        painter.drawText(rect, Qt.AlignLeft | Qt.AlignTop,
+                         opt.fontMetrics.elidedText(title, Qt.ElideRight,
+                                                    rect.width()))
+
+        bottom = QFont(opt.font)
+        bottom.setPointSizeF(max(7.0, opt.font.pointSizeF() - 1.0))
+        painter.setFont(bottom)
+        color = opt.palette.color(QPalette.Active, role)
+        if not selected:
+            color.setAlpha(170)
+        painter.setPen(color)
+        painter.drawText(rect, Qt.AlignLeft | Qt.AlignBottom,
+                         index.data(_ROLE_CAMERA_SUBTITLE) or "")
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        title = index.data(_ROLE_CAMERA_TITLE)
+        if not title:
+            return super().sizeHint(option, index)
+        fm = option.fontMetrics
+        width = max(fm.horizontalAdvance(title),
+                    fm.horizontalAdvance(index.data(_ROLE_CAMERA_SUBTITLE) or ""))
+        # the title is drawn bold, so leave some slack on the measured width
+        return QSize(int(width * 1.1) + 16, fm.height() * 2 + 10)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, make_source, make_session, camera_id: str = "camera",
                  pixel_size_mm: float | None = None,
@@ -1060,6 +1118,8 @@ class MainWindow(QMainWindow):
         self.chk_roi.setEnabled(False)
         self.lbl_camera = QLabel("Kamera")
         self.cmb_camera = QComboBox()
+        self.cmb_camera.setView(QListView())  # required for the custom delegate
+        self.cmb_camera.setItemDelegate(CameraItemDelegate(self.cmb_camera))
         self.lbl_camera_status = QLabel("")
         self.lbl_camera_status.setWordWrap(True)
         self.btn_refresh_cameras = QPushButton("Kameras aktualisieren")
@@ -1446,7 +1506,15 @@ class MainWindow(QMainWindow):
         for index, camera in enumerate(cameras):
             camera_entry = dict(camera)
             camera_entry["camera_index"] = index
-            self.cmb_camera.addItem(self._format_camera_label(camera_entry, index))
+            # the closed box is only ~280 px wide - keep it to model+serial
+            # so neither of the two gets elided away
+            self.cmb_camera.addItem(self._camera_collapsed_label(camera_entry, index))
+            # two-line rendering in the popup: type on top, serial below
+            title = self._camera_title(camera_entry, index)
+            subtitle = self._camera_subtitle(camera_entry)
+            self.cmb_camera.setItemData(index, title, _ROLE_CAMERA_TITLE)
+            self.cmb_camera.setItemData(index, subtitle, _ROLE_CAMERA_SUBTITLE)
+            self.cmb_camera.setItemData(index, f"{title}\n{subtitle}", Qt.ToolTipRole)
             self._cameras.append(camera_entry)
         self.cmb_camera.blockSignals(False)
 
@@ -1529,7 +1597,10 @@ class MainWindow(QMainWindow):
             self.lbl_camera_status.setText("Keine Kamera verfuegbar.")
             return
         model_label = self.cmb_model.currentText()
-        label = self.cmb_camera.currentText()
+        # the status line has room for the full detail the combo box elides
+        cam = self._selected_camera()
+        label = (self._format_camera_label(cam, cam.get("camera_index", 0))
+                 if cam else self.cmb_camera.currentText())
         target_label = self.cmb_target.currentText()
         exposure = "Kamera-Default"
         if self.chk_custom_exposure.isChecked():
@@ -1564,6 +1635,31 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _default_camera_label(camera: dict, index: int) -> str:
         return camera.get("serial_number") or f"Kamera {index + 1}"
+
+    @staticmethod
+    def _camera_collapsed_label(camera: dict, index: int) -> str:
+        """Text of the closed combo box: model and serial, nothing else."""
+        model = camera.get("model") or camera.get("display_name") or "Kamera"
+        return f"[{index + 1}] {model} · S/N {camera.get('serial_number') or '?'}"
+
+    @staticmethod
+    def _camera_title(camera: dict, index: int) -> str:
+        """First dropdown line: what kind of camera this is."""
+        model = " ".join(part for part in (camera.get("vendor"),
+                                           camera.get("model")) if part).strip()
+        title = f"[{index + 1}] {model or camera.get('display_name') or 'Kamera'}"
+        user_name = camera.get("user_defined_name")
+        return f'{title} "{user_name}"' if user_name else title
+
+    @staticmethod
+    def _camera_subtitle(camera: dict) -> str:
+        """Second dropdown line: how to tell two identical models apart."""
+        parts = [f"S/N {camera.get('serial_number') or '?'}"]
+        for key in ("tl_type", "ip_address"):
+            value = camera.get(key)
+            if value:
+                parts.append(str(value))
+        return "  ·  ".join(parts)
 
     # ------------------------------------------------------------------
     # result step: scan -> compute -> review page -> back to scan / export

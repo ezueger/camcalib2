@@ -217,15 +217,16 @@ class GenICamSource(FrameSource):
                 # discovery through the other producers.
                 continue
         self._harvester.update()
-        if not self._harvester.device_info_list:
+        devices = list(self._harvester.device_info_list)
+        if not devices:
             raise RuntimeError("no GenICam camera found")
 
-        kwargs = {}
-        if self.serial:
-            kwargs["search_key"] = {"serial_number": self.serial}
-            self._ia = self._harvester.create(kwargs["search_key"])
-        else:
-            self._ia = self._harvester.create(self.index)
+        # Several cameras on the bus are normal - that is what the camera
+        # dropdown is for. We resolve the selection here instead of handing
+        # an ambiguous search key to harvesters, which would refuse with
+        # "multiple devices found: provide sufficient search key".
+        device_info = self._select_device_info(devices)
+        self._ia = self._create_acquirer(device_info, devices.index(device_info))
         try:
             # small buffer queue = low latency: the live loop always sees
             # a near-current frame instead of a stale queued one
@@ -252,6 +253,70 @@ class GenICamSource(FrameSource):
         except Exception:
             self._size = None
         self._ia.start()
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def _device_info_summary(cls, device_info) -> str:
+        label = " ".join(x for x in (
+            cls._safe_device_info_value(device_info, "vendor"),
+            cls._safe_device_info_value(device_info, "model")) if x).strip()
+        serial = cls._safe_device_info_value(device_info, "serial_number")
+        return f"{label or 'GenICam'} SN={serial or '?'}"
+
+    def _select_device_info(self, devices: list):
+        """Pick exactly one device from the enumerated list.
+
+        Priority: serial number > IP/MAC > list index. If several devices
+        match (duplicate serials, unset fields) the first one wins - the
+        selection must never fail just because more cameras are connected.
+        """
+        def available() -> str:
+            return "; ".join(f"[{i}] {self._device_info_summary(d)}"
+                             for i, d in enumerate(devices))
+
+        if self.serial:
+            matches = [d for d in devices
+                       if self._safe_device_info_value(d, "serial_number") == str(self.serial)]
+            if matches:
+                return matches[0]
+            # Some GigE producers do not report serials at all (only
+            # display_name); fall through to IP/MAC when we have one.
+            if not (self.ip_address or self.mac_address):
+                raise RuntimeError(
+                    f"no camera with serial '{self.serial}' - available: {available()}")
+
+        if self.ip_address or self.mac_address:
+            for d in devices:
+                ip, mac = _parse_display_name_ip_mac(
+                    self._safe_device_info_value(d, "display_name"))
+                if self.ip_address and ip == self.ip_address:
+                    return d
+                if self.mac_address and mac and mac.lower() == str(self.mac_address).lower():
+                    return d
+            raise RuntimeError(
+                f"no camera at {self.ip_address or self.mac_address} "
+                f"- available: {available()}")
+
+        if not 0 <= self.index < len(devices):
+            raise RuntimeError(
+                f"camera index {self.index} out of range - available: {available()}")
+        return devices[self.index]
+
+    def _create_acquirer(self, device_info, index: int):
+        """Open the acquirer for ``device_info``, tolerating harvesters API drift."""
+        keys = [device_info]
+        device_id = (getattr(device_info, "property_dict", {}) or {}).get("id_")
+        if device_id:
+            keys.append({"id_": device_id})
+        keys.append(index)
+        last: Exception | None = None
+        for key in keys:
+            try:
+                return self._harvester.create(key)
+            except Exception as e:  # unsupported key type / stale device list
+                last = e
+        raise RuntimeError(
+            f"cannot open camera {self._device_info_summary(device_info)}: {last}")
 
     def _should_try_daheng_sdk(self) -> bool:
         if self.backend == "daheng_gxipy":
