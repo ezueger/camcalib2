@@ -1,16 +1,31 @@
 param(
     [bool]$Clean = $true,
     [switch]$OneFile,
-    [switch]$IncludeGenICam
+    [switch]$IncludeGenICam,
+    [string]$Python
 )
 
 $ErrorActionPreference = "Stop"
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$python = Join-Path $repoRoot ".venv\Scripts\python.exe"
 
-if (-not (Test-Path $python)) {
-    throw "Python in .venv nicht gefunden: $python"
+if ($Python) {
+    if (-not (Test-Path $Python)) {
+        throw "Angegebenes Python nicht gefunden: $Python"
+    }
+    $python = (Resolve-Path $Python).Path
+} else {
+    # ueblicher Ort ist .venv im Repo-Root; aeltere Arbeitskopien haben die
+    # venv neben dem Paket liegen
+    $candidates = @(
+        (Join-Path $repoRoot ".venv\Scripts\python.exe"),
+        (Join-Path $repoRoot "src\camcalib2\.venv\Scripts\python.exe")
+    )
+    $python = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $python) {
+        throw "Keine venv gefunden. Erwartet: $($candidates -join ' oder '). " +
+              "Alternativ -Python <pfad\python.exe> angeben."
+    }
 }
 
 Add-Type -AssemblyName System.IO.Compression
